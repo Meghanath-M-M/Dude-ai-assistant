@@ -1,0 +1,35 @@
+{
+  "open_chrome": {
+    "action": "open_app",
+    "target": "chrome",
+    "safe": true,
+    "examples": ["open chrome", "launch the browser", "start google chrome", "open my browser"]
+  },
+  "open_vscode": {
+    "action": "open_app",
+    "target": "code",
+    "safe": true,
+    "examples": ["open vscode", "launch visual studio code", "start my code editor", "open vs code"]
+  },
+  "search_web": {
+    "action": "browser_search",
+    "safe": true,
+    "examples": ["search the web for", "look up", "find this online", "google this"]
+  },
+  "system_volume": {
+    "action": "system_control",
+    "target": "volume",
+    "safe": true,
+    "examples": ["mute the volume", "turn up the sound", "lower my volume", "set volume to fifty percent"]
+  },
+  "read_screen": {
+    "action": "screen_ocr",
+    "safe": true,
+    "examples": ["read the screen", "what does this say", "read this page to me", "what is on my screen"]
+  },
+  "open_project": {
+    "action": "context_open",
+    "safe": true,
+    "examples": ["open my project", "launch my workspace", "open my ml folder", "open the project folder"]
+  }
+}

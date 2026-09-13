@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+*.wav
+memory/*.db
+assets/tts_cache/*
+assets/wake_word/*.onnx

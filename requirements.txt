@@ -1,0 +1,18 @@
+numpy>=1.26,<3
+scipy>=1.13,<2
+sounddevice>=0.4.7,<1
+
+# Phase 1+ integrations. Install after the Phase 0 check passes.
+faster-whisper>=1.1,<2
+sentence-transformers>=3,<4
+scikit-learn>=1.5,<2
+kokoro>=0.9,<1
+
+# Phase 2+ integrations.
+Pillow>=10,<13
+pytesseract>=0.3.10,<1
+pygetwindow>=0.0.9,<1
+pyautogui>=0.9.54,<1
+playwright>=1.45,<2
+openwakeword>=0.6,<1
+PyQt5>=5.15,<6
