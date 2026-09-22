@@ -93,7 +93,5 @@ python -m tests.test_mic
 
 - Wake word models (`assets/wake_word/*.onnx`) and cached Kokoro audio
   (`assets/tts_cache/*.wav`) are git-ignored and regenerate locally.
-- The next phases (Silero VAD, the PyQt HUD, voice-confirmed destructive
-  actions, the Tier 2 fallback) are tracked in the roadmap discussion; the
-  scaffolding for each already exists in `nova_agent/`.
+- Phase status, known gaps, and the next steps live in `docs/ROADMAP.md`.
 
