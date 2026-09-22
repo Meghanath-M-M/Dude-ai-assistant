@@ -6,34 +6,57 @@ from nova_agent.main import NovaAgent
 
 
 class FakeWakeEngine:
+    def __init__(self):
+        self.resets = 0
+
     def process_chunk(self, _chunk):
         return True
+
+    def reset(self):
+        self.resets += 1
 
 
 class FakeVADRecorder:
     def __init__(self):
         self.calls = 0
+        self.resets = 0
 
     def process_chunk(self, _chunk):
         self.calls += 1
         return "command.wav" if self.calls == 1 else None
 
+    def reset(self):
+        self.resets += 1
+
 
 class FakeProcessor:
     def __init__(self):
         self.path_seen = []
+        self.pending_confirmation = None
+        self.pending_text = ""
+        self.timings = {}
 
-    def process(self, audio_path):
+    def transcribe(self, audio_path, prompt=None):
         self.path_seen.append(audio_path)
+        return "open chrome"
+
+    def observe(self, text):
+        return {"text": text, "intent": {"action": "open_app", "target": "chrome"}, "score": 0.95}
+
+    def run_observation(self, _observation, confirmed=False):
         return "Would open chrome"
 
 
 class FakeHUD:
     def __init__(self):
         self.states = []
+        self.transcripts = []
 
     def set_state(self, state, message=""):
         self.states.append(state)
+
+    def show_transcript(self, text):
+        self.transcripts.append(text)
 
 
 def _frame(value: float = 0.0):
@@ -91,9 +114,22 @@ def test_nova_never_transcribes_its_own_playback():
         def __init__(self):
             self.agent = None
             self.seen = []
+            self.pending_confirmation = None
+            self.pending_text = ""
+            self.timings = {}
 
-        def process(self, audio_path):
+        def transcribe(self, audio_path, prompt=None):
             self.seen.append(audio_path)
+            return "open chrome"
+
+        def observe(self, text):
+            return {
+                "text": text,
+                "intent": {"action": "open_app", "target": "chrome"},
+                "score": 0.9,
+            }
+
+        def run_observation(self, _observation, confirmed=False):
             # Simulate Kokoro output being picked up by the open microphone.
             self.agent._on_audio(_frame(0.6), 160, None, None)
             assert self.agent.is_speaking is True

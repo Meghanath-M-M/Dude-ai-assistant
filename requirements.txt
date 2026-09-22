@@ -16,3 +16,7 @@ pyautogui>=0.9.54,<1
 playwright>=1.45,<2
 openwakeword>=0.6,<1
 PyQt5>=5.15,<6
+
+# Optional Tier 2 LLM fallback (enable with NOVA_LLM_FALLBACK=1; needs the
+# Ollama desktop app running, e.g. `ollama pull phi4-mini`).
+ollama>=0.4,<1

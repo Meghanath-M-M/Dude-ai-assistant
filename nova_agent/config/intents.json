@@ -41,5 +41,48 @@
     "action": "time_check",
     "safe": true,
     "examples": ["what time is it", "tell me the time", "what is the time", "current time"]
+  },
+  "repeat_last": {
+    "action": "repeat_last",
+    "safe": true,
+    "examples": ["do that again", "repeat that", "do it again", "run that again"]
+  },
+  "set_project": {
+    "action": "set_project",
+    "safe": true,
+    "examples": ["set project to", "remember this folder as", "set my project path"]
+  },
+  "set_browser": {
+    "action": "set_browser",
+    "safe": true,
+    "examples": ["set browser to", "change my browser to", "use another browser"]
+  },
+  "set_preference": {
+    "action": "set_preference",
+    "safe": true,
+    "examples": [
+      "set wake threshold to",
+      "enable dry run",
+      "disable dry run",
+      "go live",
+      "switch to live mode",
+      "set voice to",
+      "use voice"
+    ]
+  },
+  "close_window": {
+    "action": "close_window",
+    "safe": false,
+    "examples": ["close this window", "close the window", "close the active window"]
+  },
+  "tidy_downloads": {
+    "action": "tidy_downloads",
+    "safe": false,
+    "examples": ["clear my downloads", "tidy my downloads", "clean up my downloads"]
+  },
+  "lock_workstation": {
+    "action": "lock_workstation",
+    "safe": false,
+    "examples": ["lock the computer", "lock my screen", "lock the workstation"]
   }
 }

@@ -1,3 +1,4 @@
+import time
 import warnings
 
 
@@ -14,10 +15,43 @@ class STTEngine:
         self.device = device
         self.compute_type = compute_type
         self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        self.last_duration: float = 0.0
 
-    def transcribe(self, audio_path: str) -> str:
+    def warm_up(self) -> float:
+        """Pay the one-off model/allocator cost so the first command is fast.
+
+        faster-whisper is lazy: the first transcription of a session is several
+        times slower than the rest. Feeding it a second of silence at startup
+        moves that cost out of the user's first command.
+        """
+        import numpy as np
+
+        silence = np.zeros(16_000, dtype=np.float32)
+        started = time.perf_counter()
         try:
-            segments = self._collect_segments(audio_path)
+            self.model.transcribe(
+                silence,
+                language="en",
+                beam_size=1,
+                best_of=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+        except Exception as exc:  # noqa: BLE001 -- local runtime may differ
+            warnings.warn(f"STT warm-up failed: {exc}", RuntimeWarning, stacklevel=2)
+            return 0.0
+        return time.perf_counter() - started
+
+    def transcribe(self, audio_path: str, prompt: str | None = None) -> str:
+        """Transcribe a wav; ``prompt`` seeds Whisper's decoding context.
+
+        Wake detection primes this with the wake phrase: short two-word
+        utterances otherwise fall into Whisper's generic priors on some
+        voices ("what are you doing?" for "hey dude").
+        """
+        started = time.perf_counter()
+        try:
+            segments = self._collect_segments(audio_path, prompt)
         except RuntimeError as exc:
             if self.device != "cuda" or "cublas" not in str(exc).lower():
                 raise
@@ -33,14 +67,15 @@ class STTEngine:
                 device=self.device,
                 compute_type=self.compute_type,
             )
-            segments = self._collect_segments(audio_path)
+            segments = self._collect_segments(audio_path, prompt)
+        self.last_duration = time.perf_counter() - started
         return " ".join(segment.text for segment in segments).strip().lower()
 
-    def _collect_segments(self, audio_path: str):
-        segments, _ = self._run_transcription(audio_path)
+    def _collect_segments(self, audio_path: str, prompt: str | None = None):
+        segments, _ = self._run_transcription(audio_path, prompt)
         return list(segments)
 
-    def _run_transcription(self, audio_path: str):
+    def _run_transcription(self, audio_path: str, prompt: str | None = None):
         return self.model.transcribe(
             audio_path,
             language="en",
@@ -48,4 +83,5 @@ class STTEngine:
             best_of=1,
             vad_filter=True,
             condition_on_previous_text=False,
+            initial_prompt=prompt,
         )

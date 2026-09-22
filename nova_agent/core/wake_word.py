@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from nova_agent.config.settings import ASSETS_DIR
+
+logger = logging.getLogger(__name__)
 
 # openWakeWord does not bundle its feature models in the wheel; the copies in
 # this project keep the classifier runnable offline. Resolved absolutely so the
@@ -47,7 +51,7 @@ class WakeWordEngine:
         self,
         model_path: str = "assets/wake_word/hey_nova.onnx",
         threshold: float | None = None,
-        wake_word: str = "hey nova",
+        wake_word: str = "hey dude",
         strong_margin: float = 0.2,
         sustain_window: int = 3,
         sustain_margin: float = 0.08,
@@ -60,6 +64,7 @@ class WakeWordEngine:
         self.sustain_window = sustain_window
         self.sustain_margin = sustain_margin
         self.load_error: str | None = None
+        self.last_score: float | None = None
         self._oww_model = None
         self._wake_history: list[float] = []
         self._load_model(model_path, melspec_path, embedding_path)
@@ -98,7 +103,7 @@ class WakeWordEngine:
                 inference_framework="onnx",
                 **extra_paths,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # Never take the agent down over a detector problem, but never hide it either.
             self._oww_model = None
             self.load_error = f"{type(exc).__name__}: {exc}"
@@ -112,26 +117,85 @@ class WakeWordEngine:
     def using_model(self) -> bool:
         return self._oww_model is not None
 
+    def status(self) -> dict:
+        """Everything ``--wake-status`` reports about the live detector."""
+        return {
+            "backend": self.backend,
+            "model_path": self.model_path,
+            "threshold": self.threshold,
+            "last_score": self.last_score,
+            "load_error": self.load_error,
+        }
+
     def _predict_score(self, chunk: np.ndarray) -> float:
         if self._oww_model is not None:
             try:
                 # openWakeWord expects int16 PCM
                 pcm = (np.asarray(chunk, dtype=np.float32) * 32767).astype(np.int16)
                 self._oww_model.predict(pcm)
-                scores = []
-                for model_name in self._oww_model.prediction_buffer.keys():
-                    buf = list(self._oww_model.prediction_buffer[model_name])
-                    if buf:
-                        scores.append(float(np.max(buf)))
-                if scores:
-                    return float(np.max(scores))
-            except Exception:
-                pass
+                latest = []
+                for buf in self._oww_model.prediction_buffer.values():
+                    frames = list(buf)
+                    if frames:
+                        # The last frame reflects the audio just heard; a max over
+                        # the whole buffer would re-fire on stale peaks.
+                        latest.append(float(frames[-1]))
+                if latest:
+                    score = float(max(latest))
+                    self.last_score = score
+                    return score
+            except Exception as exc:  # noqa: BLE001
+                # Never hide why the model path broke: silent fallback to the
+                # loudness heuristic is how false wakes sneak in.
+                logger.warning(
+                    "wake-word model scoring failed (%s: %s); using energy fallback",
+                    type(exc).__name__,
+                    exc,
+                )
 
         magnitude = float(np.abs(chunk).mean())
         rms = float(np.sqrt(np.mean(np.square(chunk))))
         energy = max(magnitude, rms)
-        return float(np.clip(energy * 6.0, 0.0, 1.0))
+        score = float(np.clip(energy * 6.0, 0.0, 1.0))
+        self.last_score = score
+        return score
+
+    def reset(self) -> None:
+        """Forget detection history (used between commands)."""
+        self._wake_history.clear()
+        if self._oww_model is not None:
+            try:
+                self._oww_model.reset()
+            except Exception as exc:  # noqa: BLE001 -- reset is best effort
+                logger.debug("wake model reset failed: %s", exc)
+
+    def observe(self, chunk: np.ndarray) -> float:
+        """Return the raw score for a chunk without applying trigger logic.
+
+        Used by ``--wake-probe`` so a real threshold can be picked from what the
+        user's own voice actually scores.
+        """
+        return self._predict_score(chunk)
+
+    @staticmethod
+    def suggest_threshold(
+        scores,
+        ratio: float = 0.6,
+        minimum: float = 0.2,
+        maximum: float = 0.9,
+    ) -> float | None:
+        """Suggest a trigger score from observed wake-word scores.
+
+        The trigger sits below the peaks so a slightly quieter delivery still
+        fires, and well above the noise floor recorded alongside them.
+        """
+        values = [float(score) for score in scores if score is not None]
+        if not values:
+            return None
+        peak = max(values)
+        if peak <= 0:
+            return None
+        return round(min(max(peak * ratio, minimum), maximum), 3)
 
     def process_chunk(self, chunk: np.ndarray) -> bool:
         score = self._predict_score(chunk)

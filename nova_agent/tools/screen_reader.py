@@ -9,7 +9,7 @@ def _tesseract_available(pytesseract_module) -> bool:
         return True
     try:
         version_lookup()
-    except Exception:
+    except Exception:  # noqa: BLE001 -- any lookup failure means OCR is unavailable
         return False
     return True
 

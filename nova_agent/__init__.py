@@ -1,3 +1,3 @@
-"""Nova local voice agent package."""
+"""Dude local voice agent package."""
 
 __version__ = "0.1.0"

@@ -1,27 +1,41 @@
 from pathlib import Path
 
+import numpy as np
+from scipy.io import wavfile
+
 from nova_agent.config.settings import INTENTS_PATH
 from nova_agent.core.context_engine import ContextEngine
 from nova_agent.core.intent_router import IntentRouter
 from nova_agent.core.safety import requires_confirmation
-from nova_agent.main import CommandProcessor
 from nova_agent.core.stt import STTEngine
 from nova_agent.core.tts import TTSEngine
-from scipy.io import wavfile
-import numpy as np
+from nova_agent.main import CommandProcessor
 
 
 def test_intents_load():
     router = IntentRouter(intents_path=INTENTS_PATH)
-    assert len(router.intents) == 8
+
+    assert len(router.intents) == 15
     assert "read_screen" in router.intents
     assert "greeting" in router.intents
     assert "time_check" in router.intents
+    assert "repeat_last" in router.intents
+    assert "set_project" in router.intents
+    assert "set_browser" in router.intents
+    assert "set_preference" in router.intents
+    assert "close_window" in router.intents
 
 
 def test_safe_intents_do_not_require_confirmation():
+    """Only the three destructive tasks may demand a spoken confirmation."""
     router = IntentRouter(intents_path=INTENTS_PATH)
-    assert all(not requires_confirmation(config) for config in router.intents.values())
+
+    safe = {name: config for name, config in router.intents.items() if config.get("safe", True)}
+    risky = {name: config for name, config in router.intents.items() if not config.get("safe", True)}
+
+    assert all(not requires_confirmation(config) for config in safe.values())
+    assert all(requires_confirmation(config) for config in risky.values())
+    assert set(risky) == {"close_window", "tidy_downloads", "lock_workstation"}
 
 
 def test_intent_router_matches_phrase_with_filler_words():
@@ -42,6 +56,15 @@ def test_intent_router_matches_greeting():
     assert score >= 0.75
 
 
+def test_warm_up_loads_the_encoder_before_the_first_match():
+    router = IntentRouter(intents_path=INTENTS_PATH)
+
+    elapsed = router.warm_up()
+
+    assert router._embedding_matrix is not None
+    assert elapsed >= 0.0
+
+
 def test_intent_router_matches_time_queries():
     router = IntentRouter(intents_path=INTENTS_PATH)
     intent, score = router.match("what time is it")
@@ -55,7 +78,7 @@ class FakeSTT:
     def __init__(self, text):
         self.text = text
 
-    def transcribe(self, _audio_path):
+    def transcribe(self, _audio_path, prompt=None):
         return self.text
 
 
@@ -220,7 +243,7 @@ def test_command_processor_controls_volume_in_dry_run():
 
 
 def test_command_processor_reports_a_missing_tesseract_binary(monkeypatch):
-    import nova_agent.tools.screen_reader as screen_reader
+    from nova_agent.tools import screen_reader
 
     def missing_binary(**_kwargs):
         raise RuntimeError("Tesseract OCR is not installed.")

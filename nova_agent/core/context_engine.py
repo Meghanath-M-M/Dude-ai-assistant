@@ -5,7 +5,12 @@ from pathlib import Path
 class ContextEngine:
     def __init__(self, database_path: Path = Path("memory/nova.db")):
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(database_path)
+        # Commands execute on the consumer thread while the connection opens on
+        # the main thread, which sqlite3's default thread check rejects
+        # (get_alias crashed mid-command). Usage is effectively sequential —
+        # the main thread touches context only before the worker starts — so
+        # one shared connection with the check relaxed is safe.
+        self.connection = sqlite3.connect(database_path, check_same_thread=False)
         self._initialize()
 
     def _initialize(self) -> None:
@@ -25,8 +30,33 @@ class ContextEngine:
                 raw_text TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS app_aliases (
+                alias TEXT PRIMARY KEY,
+                app_key TEXT NOT NULL
+            );
         """)
         self.connection.commit()
+
+    def set_alias(self, alias: str, app_key: str) -> None:
+        """Remember "browser" means "chrome" (or whatever the user prefers)."""
+        self.connection.execute(
+            "INSERT INTO app_aliases (alias, app_key) VALUES (?, ?) "
+            "ON CONFLICT(alias) DO UPDATE SET app_key = excluded.app_key",
+            (alias.strip().lower(), app_key),
+        )
+        self.connection.commit()
+
+    def get_alias(self, alias: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT app_key FROM app_aliases WHERE alias = ?",
+            (alias.strip().lower(),),
+        ).fetchone()
+        return row[0] if row else None
+
+    def resolve_app(self, name: str) -> str:
+        """Map a spoken app name onto a configured executable key."""
+        candidate = (name or "").strip().lower()
+        return self.get_alias(candidate) or candidate or "chrome"
 
     def log_command(self, intent: str, raw_text: str) -> None:
         self.connection.execute(
@@ -85,9 +115,9 @@ class ContextEngine:
         )
         self.connection.commit()
 
-    def get_preference(self, key: str) -> str | None:
+    def get_preference(self, key: str, default: str | None = None) -> str | None:
         row = self.connection.execute(
             "SELECT value FROM preferences WHERE key = ?",
             (key,),
         ).fetchone()
-        return row[0] if row else None
+        return row[0] if row else default

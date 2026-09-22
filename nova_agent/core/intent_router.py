@@ -1,14 +1,17 @@
 import json
 import re
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 
 class IntentRouter:
-    PROJECT_WORDS = {"project", "projects", "workspace", "folder", "repo", "repository"}
-    VOLUME_WORDS = {"volume", "sound", "mute", "unmute", "louder", "quieter"}
+    PROJECT_WORDS: ClassVar[set[str]] = {
+        "project", "projects", "workspace", "folder", "repo", "repository"
+    }
+    VOLUME_WORDS: ClassVar[set[str]] = {"volume", "sound", "mute", "unmute", "louder", "quieter"}
 
-    FILLER_WORDS = {
+    FILLER_WORDS: ClassVar[set[str]] = {
         "hello",
         "hi",
         "hey",
@@ -25,7 +28,6 @@ class IntentRouter:
         "my",
         "me",
         "now",
-        "please",
     }
 
     def __init__(
@@ -33,6 +35,7 @@ class IntentRouter:
         threshold: float = 0.82,
         intents_path: Path | None = None,
         fallback: Any | None = None,
+        fallback_floor: float = 0.65,
     ):
         self.threshold = threshold
         self.project_root = Path(__file__).resolve().parents[2]
@@ -44,6 +47,9 @@ class IntentRouter:
         self._embedding_matrix = None
         self._labels: list[str] = []
         self.fallback = fallback
+        # Below this score Tier 1 wasn't even close: answering with the LLM
+        # would be guessing, so the dispatcher re-asks instead.
+        self.fallback_floor = fallback_floor
 
     def _load_intents(self) -> dict[str, dict[str, Any]]:
         with self.intents_path.open(encoding="utf-8") as file:
@@ -66,6 +72,19 @@ class IntentRouter:
                 examples.append(example)
         self._encoder = SentenceTransformer("all-MiniLM-L6-v2")
         self._embedding_matrix = self._encoder.encode(examples, normalize_embeddings=True)
+
+    def warm_up(self) -> float:
+        """Load the embedding model eagerly and return the seconds spent.
+
+        ``_prepare_embeddings`` is lazy, so without this call the first
+        *command* pays for ``import sentence_transformers`` (torch included)
+        plus the MiniLM load — measured live at 9.7s inside the intent stage,
+        long enough to outlive the post-wake retry window.
+        """
+        started = time.perf_counter()
+        self._prepare_embeddings()
+        self._encoder.encode(["warm up the intent encoder"], normalize_embeddings=True)
+        return time.perf_counter() - started
 
     def _canonicalize(self, text: str) -> str:
         cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
@@ -93,14 +112,17 @@ class IntentRouter:
         # "open my ml project" barely differs from the examples yet can land
         # under the embedding threshold, so claim the obvious shapes outright.
         tokens = normalized.split()
-        if tokens and tokens[0] in {"open", "launch", "show", "start"}:
-            if any(word in tokens for word in self.PROJECT_WORDS):
-                return self.intents["open_project"], 0.75
+        if (
+            tokens
+            and tokens[0] in {"open", "launch", "show", "start"}
+            and any(word in tokens for word in self.PROJECT_WORDS)
+        ):
+            return self.intents["open_project"], 0.75
 
         if any(word in tokens for word in self.VOLUME_WORDS):
             return self.intents["system_volume"], 0.75
 
-        for _, config in self.intents.items():
+        for config in self.intents.values():
             for example in config.get("examples", []):
                 example_text = self._canonicalize(example)
                 if not example_text:
@@ -129,7 +151,7 @@ class IntentRouter:
         if lexical_intent is not None:
             return lexical_intent, lexical_score
 
-        if self.fallback is not None:
+        if self.fallback is not None and score >= self.fallback_floor:
             fallback_intent = self.fallback.classify(text)
             # "unknown" must stay a miss, otherwise the dispatcher reports
             # "The unknown action is not enabled yet" instead of asking again.

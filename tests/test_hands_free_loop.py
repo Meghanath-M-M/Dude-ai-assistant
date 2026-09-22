@@ -7,6 +7,9 @@ class FakeWakeWordEngine:
     def process_chunk(self, _chunk):
         return True
 
+    def reset(self):
+        pass
+
 
 class FakeVADRecorder:
     def __init__(self):
@@ -16,13 +19,25 @@ class FakeVADRecorder:
         self.calls += 1
         return "command.wav" if self.calls == 1 else None
 
+    def reset(self):
+        pass
+
 
 class FakeProcessor:
     def __init__(self):
         self.path_seen = []
+        self.pending_confirmation = None
+        self.pending_text = ""
+        self.timings = {}
 
-    def process(self, audio_path):
+    def transcribe(self, audio_path, prompt=None):
         self.path_seen.append(audio_path)
+        return "open chrome"
+
+    def observe(self, text):
+        return {"text": text, "intent": {"action": "open_app", "target": "chrome"}, "score": 0.95}
+
+    def run_observation(self, _observation, confirmed=False):
         return "Would open chrome"
 
 

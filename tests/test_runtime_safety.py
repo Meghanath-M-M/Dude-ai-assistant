@@ -1,15 +1,16 @@
 from pathlib import Path
 
+from nova_agent.config.settings import Settings
 from nova_agent.core.context_engine import ContextEngine
-from nova_agent.core.safety import requires_confirmation, confirmation_prompt
-from nova_agent.main import CommandProcessor
+from nova_agent.core.safety import confirmation_prompt, requires_confirmation
+from nova_agent.main import CommandProcessor, build_registry
 
 
 class FakeSTT:
     def __init__(self, text):
         self.text = text
 
-    def transcribe(self, _audio_path):
+    def transcribe(self, _audio_path, prompt=None):
         return self.text
 
 
@@ -85,3 +86,43 @@ def test_command_processor_logs_commands_to_context_engine(tmp_path):
     processor.process("command.wav")
 
     assert engine.get_last_command() == ("open_app", "open chrome")
+
+
+def test_unsafe_action_never_executes_without_spoken_confirmation(monkeypatch):
+    executed = []
+
+    def fake_execute(action, _intent, _text):
+        executed.append(action)
+        return "ran"
+
+    processor = CommandProcessor(
+        FakeSTT("delete the file"),
+        FakeRouter({"action": "delete_file", "safe": False}),
+        FakeTTS(),
+    )
+    monkeypatch.setattr(processor, "execute", fake_execute)
+
+    response = processor.process("command.wav")
+
+    assert executed == []
+    assert response == "About to delete file. Say confirm to proceed."
+    assert processor.pending_confirmation is not None
+
+    response = processor.process("command.wav", confirmed=True)
+
+    assert executed == ["delete_file"]
+
+
+def test_destructive_action_stays_disabled_even_after_a_spoken_confirmation():
+    """Confirmation alone cannot bypass the capability gate (no env flag)."""
+    processor = CommandProcessor(
+        FakeSTT("close the window"),
+        FakeRouter({"action": "close_window", "safe": False}),
+        FakeTTS(),
+        capabilities=build_registry(Settings()),
+    )
+
+    response = processor.process("command.wav", confirmed=True)
+
+    assert response == "The close window action is not enabled yet"
+    assert processor.pending_confirmation is None
