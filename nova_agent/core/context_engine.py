@@ -40,3 +40,54 @@ class ContextEngine:
             "SELECT intent, raw_text FROM command_history ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return row if row else None
+
+    def set_project(self, name: str, path: str) -> None:
+        self.connection.execute(
+            "INSERT INTO projects (name, path) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET path = excluded.path, last_opened = CURRENT_TIMESTAMP",
+            (name, path),
+        )
+        self.connection.commit()
+
+    def get_project(self, name: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT path FROM projects WHERE name = ?",
+            (name,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def find_project(self, name: str) -> str | None:
+        """Resolve a spoken project name, tolerating partial input.
+
+        Voice input rarely matches the stored name exactly ("my ml folder" vs
+        "ML Projects"), so fall back to a case-insensitive contains match.
+        """
+        candidate = name.strip()
+        if not candidate:
+            return None
+
+        exact = self.get_project(candidate)
+        if exact:
+            return exact
+
+        row = self.connection.execute(
+            "SELECT path FROM projects "
+            "WHERE lower(name) LIKE ? ORDER BY last_opened DESC LIMIT 1",
+            (f"%{candidate.lower()}%",),
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_preference(self, key: str, value: str) -> None:
+        self.connection.execute(
+            "INSERT INTO preferences (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        self.connection.commit()
+
+    def get_preference(self, key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT value FROM preferences WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row[0] if row else None

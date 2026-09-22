@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Local-first Windows voice agent"
 requires-python = ">=3.11"
 
+[project.scripts]
+nova-agent = "nova_agent.main:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

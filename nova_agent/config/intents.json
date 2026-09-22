@@ -31,5 +31,15 @@
     "action": "context_open",
     "safe": true,
     "examples": ["open my project", "launch my workspace", "open my ml folder", "open the project folder"]
+  },
+  "greeting": {
+    "action": "greet",
+    "safe": true,
+    "examples": ["hello", "hi", "hey there", "good morning", "good afternoon"]
+  },
+  "time_check": {
+    "action": "time_check",
+    "safe": true,
+    "examples": ["what time is it", "tell me the time", "what is the time", "current time"]
   }
 }
