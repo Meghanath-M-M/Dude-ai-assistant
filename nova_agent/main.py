@@ -100,7 +100,9 @@ class CommandProcessor:
         if action == "context_open":
             return self._open_project(text)
 
-        if action == "system_volume":
+        # intents.json declares this task as "system_control"; accept the task
+        # name too so a rename cannot silently disable volume control.
+        if action in {"system_control", "system_volume"}:
             return self._control_volume(text)
 
         if action == "greet":

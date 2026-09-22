@@ -1,4 +1,7 @@
+from pathlib import Path
+
 from nova_agent.config.settings import INTENTS_PATH
+from nova_agent.core.context_engine import ContextEngine
 from nova_agent.core.intent_router import IntentRouter
 from nova_agent.core.safety import requires_confirmation
 from nova_agent.main import CommandProcessor
@@ -159,3 +162,76 @@ def test_tts_cache_path_is_windows_safe(tmp_path):
 
     assert cache_path.name == "hello_how_can_i_help.wav"
     assert all(character not in cache_path.name for character in "<>:/\\|?*")
+
+
+def test_intent_router_routes_project_phrases():
+    router = IntentRouter(intents_path=INTENTS_PATH)
+    intent, score = router.match("open my ml project")
+
+    assert intent is not None
+    assert intent["action"] == "context_open"
+    assert score >= 0.75
+
+
+def test_intent_router_routes_volume_phrases():
+    router = IntentRouter(intents_path=INTENTS_PATH)
+    intent, score = router.match("mute the volume")
+
+    assert intent is not None
+    assert intent["action"] == "system_control"
+    assert score >= 0.75
+
+
+def test_command_processor_opens_a_stored_project(tmp_path):
+    context = ContextEngine(Path(tmp_path) / "nova.db")
+    context.set_project("ML Projects", "C:/work/ml")
+    processor = CommandProcessor(
+        FakeSTT("open my ml project"),
+        FakeRouter({"action": "context_open"}),
+        FakeTTS(),
+        context=context,
+    )
+
+    assert processor.process("command.wav") == "Would open project ml at C:/work/ml"
+
+
+def test_command_processor_asks_when_no_project_is_known(tmp_path):
+    context = ContextEngine(Path(tmp_path) / "nova.db")
+    processor = CommandProcessor(
+        FakeSTT("open my rust project"),
+        FakeRouter({"action": "context_open"}),
+        FakeTTS(),
+        context=context,
+    )
+
+    response = processor.process("command.wav")
+
+    assert response.startswith("I don't know where rust is")
+
+
+def test_command_processor_controls_volume_in_dry_run():
+    processor = CommandProcessor(
+        FakeSTT("mute the volume"),
+        FakeRouter({"action": "system_control", "target": "volume"}),
+        FakeTTS(),
+    )
+
+    assert processor.process("command.wav") == "Would press volumemute 5 times"
+
+
+def test_command_processor_reports_a_missing_tesseract_binary(monkeypatch):
+    import nova_agent.tools.screen_reader as screen_reader
+
+    def missing_binary(**_kwargs):
+        raise RuntimeError("Tesseract OCR is not installed.")
+
+    monkeypatch.setattr(screen_reader, "read_screen", missing_binary)
+    processor = CommandProcessor(
+        FakeSTT("read the screen"),
+        FakeRouter({"action": "screen_ocr"}),
+        FakeTTS(),
+    )
+
+    response = processor.process("command.wav")
+
+    assert response == "Screen reading is unavailable. Tesseract OCR is not installed."

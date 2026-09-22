@@ -5,6 +5,9 @@ from typing import Any
 
 
 class IntentRouter:
+    PROJECT_WORDS = {"project", "projects", "workspace", "folder", "repo", "repository"}
+    VOLUME_WORDS = {"volume", "sound", "mute", "unmute", "louder", "quieter"}
+
     FILLER_WORDS = {
         "hello",
         "hi",
@@ -86,6 +89,16 @@ class IntentRouter:
 
         if normalized in {"read screen", "screen", "what this say", "read page"}:
             return self.intents["read_screen"], 0.75
+
+        # "open my ml project" barely differs from the examples yet can land
+        # under the embedding threshold, so claim the obvious shapes outright.
+        tokens = normalized.split()
+        if tokens and tokens[0] in {"open", "launch", "show", "start"}:
+            if any(word in tokens for word in self.PROJECT_WORDS):
+                return self.intents["open_project"], 0.75
+
+        if any(word in tokens for word in self.VOLUME_WORDS):
+            return self.intents["system_volume"], 0.75
 
         for _, config in self.intents.items():
             for example in config.get("examples", []):
