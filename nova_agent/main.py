@@ -2,6 +2,7 @@ import argparse
 import importlib.util
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -22,6 +23,7 @@ from nova_agent.core.capabilities import CapabilityRegistry
 from nova_agent.core.context_engine import ContextEngine
 from nova_agent.core.intent_router import IntentRouter
 from nova_agent.core.query_extractor import (
+    APP_WORDS,
     extract_app_phrase,
     extract_project_name,
     extract_search_query,
@@ -41,8 +43,15 @@ from nova_agent.core.safety import (
 from nova_agent.core.vad import VADRecorder
 from nova_agent.core.wake_phrase import wake_phrase_hits
 from nova_agent.core.wake_word import WakeWordEngine
-from nova_agent.tools.app_controller import APP_PATHS, open_app
+from nova_agent.tools.app_controller import (
+    APP_PATHS,
+    RESOLVE_ALIASES,
+    open_app,
+    open_path,
+    resolve_app,
+)
 from nova_agent.tools.browser import search_web
+from nova_agent.tools.screen_reader import TESSERACT_MISSING_MESSAGE
 from nova_agent.ui.overlay import NovaHUD
 
 try:
@@ -86,6 +95,8 @@ IMPLEMENTED_ACTIONS = (
     "greet",
     "time_check",
     "repeat_last",
+    "identity",
+    "help",
     "set_project",
     "set_browser",
     "set_preference",
@@ -93,6 +104,31 @@ IMPLEMENTED_ACTIONS = (
     "tidy_downloads",
     "lock_workstation",
 )
+
+# Spoken descriptions for the "help" intent, keyed by action. Prose-sized on
+# purpose: TTS reads every word of the reply, and the list is capped.
+ACTION_LABELS = {
+    "open_app": "open apps",
+    "browser_search": "search the web",
+    "screen_ocr": "read the screen",
+    "context_open": "open saved projects",
+    "system_control": "control the volume",
+    "greet": "say hello",
+    "time_check": "tell the time",
+    "repeat_last": "repeat the last command",
+    "identity": "tell you who I am",
+    "help": "list what I can do",
+    "set_project": "remember projects",
+    "set_browser": "switch browsers",
+    "set_preference": "change my settings",
+    "close_window": "close windows",
+    "tidy_downloads": "tidy downloads",
+    "lock_workstation": "lock the workstation",
+}
+MAX_HELP_ITEMS = 7
+
+# The assistant's spoken identity, and what it says when asked what it can do.
+IDENTITY_RESPONSE = "I'm Dude, your local assistant. Nothing you say leaves this machine."
 
 # Actions that change or destroy something. They stay disabled unless
 # NOVA_ALLOW_DESTRUCTIVE=1, and always require a spoken confirmation.
@@ -145,15 +181,52 @@ class CommandProcessor:
         self.wake_engine = wake_engine
         self.pending_confirmation: dict | None = None
         self.pending_text: str = ""
+        # Set when a launch verb named no app ("open."): the next capture is
+        # read as the missing target instead of as a fresh command.
+        self.pending_clarification: str | None = None
         self.last_intent: dict | None = None
         self.last_text: str = ""
         self.timings: dict[str, float] = {}
 
-    def transcribe(self, audio_path: str | Path, prompt: str | None = None) -> str:
+    def transcribe(
+        self,
+        audio_path: str | Path,
+        prompt: str | None = None,
+        *,
+        command: bool = False,
+    ) -> str:
+        """Transcribe one capture.
+
+        ``command`` marks the command slot and adds the app-name vocabulary as
+        a decode hint. Wake segments and confirmation replies must not get it:
+        biasing a "yes" toward "notepad" is how a confirmation gets rejected.
+        """
         started = time.perf_counter()
-        text = self.stt.transcribe(str(audio_path), prompt=prompt)
+        text = self.stt.transcribe(
+            str(audio_path),
+            prompt=prompt,
+            hotwords=self.stt_hotwords() if command else None,
+        )
         self.timings["stt"] = time.perf_counter() - started
         return text
+
+    def stt_hotwords(self) -> str | None:
+        """Spoken app names to bias the command decode toward, or ``None``.
+
+        Field evidence: Whisper-small turned clear, loud command audio into
+        "open by 10 projects" and "we hope the volume". Names are the worst
+        offenders because the model has never seen them, so the vocabulary is
+        the set of names *this* install understands: the built-in app words,
+        the resolver aliases, and whatever the user taught with "set browser
+        to ...". Cheap enough to rebuild per command (one small SELECT), which
+        is what lets "set browser to edge" take effect immediately.
+        """
+        names = set(APP_WORDS) | set(RESOLVE_ALIASES)
+        if self.context is not None:
+            for alias, app_key in self.context.list_aliases():
+                names.update({alias, app_key})
+        names.discard("")
+        return ", ".join(sorted(names)) or None
 
     def observe(self, text: str) -> dict:
         """Decide what was asked, without doing anything about it."""
@@ -168,24 +241,53 @@ class CommandProcessor:
 
     def process(self, audio_path: str | Path, confirmed: bool = False) -> str:
         """Transcribe and run one command (kept for the one-shot path)."""
-        observation = self.observe(self.transcribe(audio_path))
+        observation = self.observe(
+            self.transcribe(audio_path, prompt=COMMAND_PROMPT, command=True)
+        )
         return self.run_observation(observation, confirmed=confirmed)
 
     def run_observation(self, observation: dict, confirmed: bool = False) -> str:
         text = observation.get("text", "")
         intent = observation.get("intent")
         score = observation.get("score", 0.0)
+        # What dispatch and history use. Only the "Open what?" answer differs:
+        # it is the target of a verb the user already said, so it is dispatched
+        # (and recorded) as the completed command rather than as a bare name.
+        dispatch_text = text
 
         # Misses used to print nothing at all: the console looked dead while
         # the reply was spoken, and a *cached* reply emits no synthesis
         # warnings either — indistinguishable from a broken loop.
         if not text:
             print("Heard: (nothing intelligible)")
-            return self._respond("I didn't catch that")
+            return self._respond(MISS_RESPONSE)
+
+        if intent is None and self.pending_clarification == "open_app":
+            # Answer to "Open what?" — the *name* of the app was the question,
+            # so a bare "notepad" is the target, not a new command. It has to
+            # be dispatched as the command it completes ("open notepad"):
+            # phrase extraction is anchored on the launch verb, so the bare
+            # name would only ask the question again.
+            self.pending_clarification = None
+            intent = {"action": "open_app", "safe": True}
+            dispatch_text = f"open {text}"
+            score = 0.75
+        elif intent is not None:
+            # A recognised command answers nothing: the old question is stale.
+            self.pending_clarification = None
+
         if intent is None:
+            # Name the runner-up intent: "0.51 below the band" is not
+            # actionable, "0.51 for time_check" tells the user the pipeline
+            # heard the right thing and the threshold is what dropped it.
+            best = getattr(self.router, "last_best_label", None)
+            runner_up = f" for {best}" if best else ""
             print(f"Heard: {text}")
-            print(f"Intent: none (best score {score:.2f} below the confidence band)")
-            return self._respond("I didn't catch that")
+            print(
+                f"Intent: none (best score {score:.2f}{runner_up}, "
+                "below the confidence band)"
+            )
+            return self._respond(MISS_RESPONSE)
 
         action = intent["action"]
         print(f"Heard: {text}")
@@ -205,14 +307,14 @@ class CommandProcessor:
             )
 
         started = time.perf_counter()
-        response = self.execute(action, intent, text)
+        response = self.execute(action, intent, dispatch_text)
         self.timings["action"] = time.perf_counter() - started
 
         self.pending_confirmation = None
         self.last_intent = intent
-        self.last_text = text
+        self.last_text = dispatch_text
         if self.context is not None:
-            self.context.log_command(action, text)
+            self.context.log_command(action, dispatch_text)
         return self._respond(response)
 
     def execute(self, action: str, intent: dict, text: str) -> str:
@@ -238,10 +340,20 @@ class CommandProcessor:
             return self._control_volume(text)
 
         if action == "greet":
+            # "bye" is a greeting-shaped command; answering it with "How can I
+            # help?" sounded like the assistant had not understood.
+            if set(re.findall(r"[a-z']+", text.lower())) & {"bye", "goodbye"}:
+                return "Goodbye. Talk to you soon."
             return f"{time_of_day_greeting()}. How can I help?"
 
         if action == "time_check":
             return f"The current time is {datetime.now().strftime('%I:%M %p')}."  # noqa: DTZ005
+
+        if action == "identity":
+            return IDENTITY_RESPONSE
+
+        if action == "help":
+            return self._describe_capabilities()
 
         if action == "repeat_last":
             return self._repeat_last()
@@ -275,10 +387,16 @@ class CommandProcessor:
     def _respond(self, response: str) -> str:
         started = time.perf_counter()
         # Every spoken line is also shown: TTS-only replies made a missed
-        # command indistinguishable from a dead loop.
+        # command indistinguishable from a dead loop. The console gets the
+        # full response; TTS gets the speakable form (no path recitation).
         print(f"Response: {response}")
-        self.tts.speak(response)
-        self.timings["tts"] = time.perf_counter() - started
+        self.tts.speak(speakable(response))
+        elapsed = time.perf_counter() - started
+        # Playback lasts as long as the reply *is* — content, not performance.
+        # An engine that self-reports time-to-speech wins; test fakes (and
+        # engines without the marker) keep the whole call.
+        synth = getattr(self.tts, "last_synthesis_seconds", None)
+        self.timings["tts"] = elapsed if synth is None else synth
         return response
 
     def _read_screen(self) -> str:
@@ -332,15 +450,28 @@ class CommandProcessor:
         if phrase is None:
             if looks_like_open_command(text):
                 return "I don't know how to open that yet."
+            target = intent.get("target")
+            if not target:
+                # Nothing was named at all ("open.", "launch"). Defaulting to
+                # chrome here turned every mangled launch verb into a browser
+                # launch (field log: `Heard: open.` -> "Would open chrome"),
+                # which is worse than admitting the sentence was incomplete.
+                # Ask — and remember asking, so the answer ("notepad") is read
+                # as the missing target instead of as a fresh command.
+                self.pending_clarification = "open_app"
+                return OPEN_WHAT_RESPONSE
             # No app named at all (for example a bare "chrome"): trust the intent.
-            phrase = str(intent.get("target") or "chrome")
+            phrase = str(target)
 
         alias = self.context.get_alias(phrase) if self.context is not None else None
-        from nova_agent.core.query_extractor import APP_WORDS
-
         key = alias or APP_WORDS.get(phrase, phrase)
         if key not in APP_PATHS:
-            return f"I don't have a path configured for {key} yet."
+            # Out-of-the-box app: resolve through PATH (System32 tools) and
+            # the Start Menu, or say honestly that we do not know it.
+            resolved = resolve_app(key)
+            if resolved is None:
+                return f"I don't know how to open {key} yet."
+            return open_path(key, resolved, dry_run=self.dry_run)
         return open_app(key, dry_run=self.dry_run)
 
     def _set_project(self, text: str) -> str:
@@ -360,8 +491,10 @@ class CommandProcessor:
             return "Say it like: set browser to chrome."
         if self.context is None:
             return "I can't remember preferences without a context store."
-        if app not in APP_PATHS:
-            return f"I don't have a path configured for {app} yet."
+        if app not in APP_PATHS and resolve_app(app) is None:
+            # Remembering an alias only makes sense if opening can resolve it
+            # later (APP_PATHS, PATH, or a Start Menu shortcut).
+            return f"I don't know how to open {app} yet."
         self.context.set_alias("browser", app)
         return f"Browser set to {app}."
 
@@ -421,6 +554,53 @@ class CommandProcessor:
             return confirmation_prompt(intent)
         return self.execute(intent["action"], intent, text)
 
+    def _describe_capabilities(self) -> str:
+        """Answer "what can you do?" from the capability registry.
+
+        Deliberately reads the registry and not intents.json: an action that is
+        switched off (destructive ones without NOVA_ALLOW_DESTRUCTIVE=1) must
+        not be advertised. Capped and prose-sized because every word is spoken.
+        """
+        if self.capabilities is None:
+            return "I can open apps and answer questions about my commands."
+        labels = [
+            ACTION_LABELS[action]
+            for action in self.capabilities.list_enabled()
+            if action in ACTION_LABELS
+        ]
+        if not labels:
+            return "I have no actions enabled right now."
+        return f"I can {', '.join(labels[:MAX_HELP_ITEMS])}."
+
+    def canned_replies(self) -> tuple[str, ...]:
+        """The fixed replies this processor can answer with.
+
+        The TTS warm-up preloads these into the phrase cache so no user command
+        ever pays their synthesis — the longest of them, the screen-reading
+        failure, measured 2669ms of synthesis against a 2500ms tts budget and
+        the cache policy (short, digit-free phrases) would never store it. The
+        greeting and the help list are computed, but they stay the same for the
+        life of the process, which is all a cache needs.
+        """
+        return (
+            MISS_RESPONSE,
+            OPEN_WHAT_RESPONSE,
+            IDENTITY_RESPONSE,
+            CANCELLED_RESPONSE,
+            self._describe_capabilities(),
+            "Good morning. How can I help?",
+            "Good afternoon. How can I help?",
+            "Good evening. How can I help?",
+            "Goodbye. Talk to you soon.",
+            f"Screen reading is unavailable. {TESSERACT_MISSING_MESSAGE}",
+            "Screen reading needs Tesseract OCR to be installed.",
+            "What should I search for?",
+            "Do you want the volume up, down, or muted?",
+            "I don't know how to open that yet.",
+            "I don't know where that is. Say set project ml to a folder path.",
+            "I haven't run anything yet.",
+        )
+
     def _intent_for_action(self, action: str) -> dict | None:
         for config in self.router.intents.values():
             if config.get("action") == action:
@@ -430,7 +610,15 @@ class CommandProcessor:
 
 # Phase 3 latency budget, seconds. The verdict uses the worst command in the
 # run: every stage must hold on every command, not just on average.
-LATENCY_BUDGETS = {"stt": 1.2, "intent": 0.1, "tts": 0.05, "action": 0.5, "total": 2.0}
+# Field-calibrated over three rounds (2-command probe, 13 commands, 11
+# commands). Commands handled while the background warm-up thread holds the
+# lazy loads are excluded from stats (see NovaAgent.warm_done) — they block
+# by design, and one boot-window command would otherwise pin the verdict to a
+# number no steady-state command sees. tts counts synthesis-to-audio only;
+# total is wall clock including *speaking* the reply (paths are never spoken,
+# see speakable()), so it is content-bound and deliberately generous;
+# stages carry the performance signal.
+LATENCY_BUDGETS = {"stt": 3.0, "intent": 0.2, "tts": 2.5, "action": 0.5, "total": 15.0}
 
 
 def format_stats(history: list[dict[str, float]]) -> str:
@@ -506,6 +694,15 @@ def _looks_like_voice(name: str) -> bool:
 # retry signal: a miss inside the wake window keeps the command turn alive.
 MISS_RESPONSE = "I didn't catch that"
 
+# Asked when a launch verb named no app at all ("open."). Retries like a miss —
+# the turn stays open for the answer, which pending_clarification turns into the
+# missing target.
+OPEN_WHAT_RESPONSE = "Open what?"
+RETRY_RESPONSES = (MISS_RESPONSE, OPEN_WHAT_RESPONSE)
+
+# Spoken when a confirmation is rejected, times out, or its turn is abandoned.
+CANCELLED_RESPONSE = "Cancelled"
+
 
 class NovaAgent:
     """Coordinate wake-word detection, command capture, and processing."""
@@ -565,6 +762,14 @@ class NovaAgent:
         self.debug = debug
         self.stats = stats
         self.stats_history: list[dict[str, float]] = []
+        # Cleared by run() while the background model warm-up is in flight,
+        # set again when it finishes (set by default so direct test harnesses
+        # that never run() still record). Commands handled mid-warm block on
+        # the lazy loads by design — boot artifacts that would otherwise pin
+        # the worst-case budget verdict to numbers no steady-state command
+        # ever sees (field: intent 1986ms, total 24843ms on command #1).
+        self.warm_done = threading.Event()
+        self.warm_done.set()
         self.dry_run = dry_run
         self.confirmation_timeout = settings.confirmation_timeout
         # Microphone frames are handed to a worker thread so the PortAudio
@@ -644,8 +849,11 @@ class NovaAgent:
         consume it (command #1 took 13.33s end to end against an 8s window,
         so the retry never fired). ``command_max_turn`` still bounds the whole
         turn so background audio cannot hold it hostage.
+
+        The clarification question retries too: "Open what?" is only useful if
+        the answer can still be captured without saying the wake word again.
         """
-        if response != MISS_RESPONSE:
+        if response not in RETRY_RESPONSES:
             self.listening = False
             self.hud.set_state("idle", "idle")
             return
@@ -738,6 +946,19 @@ class NovaAgent:
         """
         if self.processor is None:
             return ""
+        # Decide the stats verdict up front: a command that *started* while the
+        # background warm-up held the model loads is a boot artifact however it
+        # ends. Field round 4 proved the end check alone is racy — command #1
+        # blocked on the encoder lock, then its TTS blocked on the warm-up's
+        # synthesis lock, so it finished after warm_done.set() and got counted
+        # (intent 19088ms, total 33010ms pinned the verdict).
+        warm_at_start = self.warm_done.is_set()
+        # Per-command stage timings: the wake-segment transcription also runs
+        # through processor.transcribe, and a text-path command (transcript-wake
+        # remainder) never transcribes at all — without a reset, its snapshot
+        # inherited the wake segment's stt (field round 4: a 10888ms idle
+        # segment leaked into a command row).
+        self.processor.timings.clear()
         self.hud.set_state("speaking", "Processing")
         started = time.perf_counter()
         # Mute the pipeline while it works: Kokoro playback would otherwise
@@ -757,9 +978,12 @@ class NovaAgent:
             print(f"[debug] command handled in {elapsed:.2f}s")
         self._record_metrics(elapsed)
         if self.stats:
-            snapshot = dict(self.processor.timings)
-            snapshot["total"] = elapsed
-            self.stats_history.append(snapshot)
+            if not warm_at_start or not self.warm_done.is_set():
+                print("[stats] command handled during model warm-up; not counted")
+            else:
+                snapshot = dict(self.processor.timings)
+                snapshot["total"] = elapsed
+                self.stats_history.append(snapshot)
         return response
 
     def handle_command(
@@ -776,7 +1000,9 @@ class NovaAgent:
         MAX_COMMAND_SWAPS so destructive prompts cannot ping-pong forever.
         """
         if text is None:
-            text = self.processor.transcribe(audio_path)
+            text = self.processor.transcribe(
+                audio_path, prompt=COMMAND_PROMPT, command=True
+            )
         self.hud.show_transcript(text)
         observation = self.processor.observe(text)
         response = self.processor.run_observation(observation, confirmed=confirmed)
@@ -814,7 +1040,7 @@ class NovaAgent:
             # The swap asked for its own confirmation: loop and ask again.
 
         self.processor.pending_confirmation = None
-        return self.processor.respond("Cancelled")
+        return self.processor.respond(CANCELLED_RESPONSE)
 
     def _debug_stages(self) -> None:
         if self.debug and self.processor.timings:
@@ -848,7 +1074,7 @@ class NovaAgent:
 
             self.is_speaking = True
             try:
-                reply = self.processor.transcribe(result)
+                reply = self.processor.transcribe(result, prompt=COMMAND_PROMPT)
             finally:
                 self.is_speaking = False
                 self._discard_pending_audio()
@@ -951,15 +1177,15 @@ class NovaAgent:
                 warm = stt.warm_up()
                 print(f"STT warm-up: {warm:.2f}s on {stt.device}")
             router = build_router(settings, self.capabilities)
-            if settings.intent_warmup:
-                # Same lazy-load tax as STT, paid here instead of on command #1:
-                # a cold encoder measured 9.7s inside the intent stage live.
-                print(f"Intent warm-up: {router.warm_up():.2f}s")
             self.processor = CommandProcessor(
                 stt,
                 router,
                 TTSEngine(
-                    voice=self.context.get_preference("tts_voice") or settings.tts_voice
+                    voice=self.context.get_preference("tts_voice") or settings.tts_voice,
+                    # settings is the documented home of the cache policy; the
+                    # engine used to fall back to its own identical defaults.
+                    max_cache_words=settings.tts_max_cache_words,
+                    max_cache_characters=settings.tts_max_cache_characters,
                 ),
                 dry_run=dry_run,
                 context=self.context,
@@ -968,6 +1194,40 @@ class NovaAgent:
                 monitor=self.monitor,
                 wake_engine=self.wake_engine,
             )
+            if settings.intent_warmup or settings.tts_warmup:
+                # Warm off the boot path: cold loads measured 21.3s (intent)
+                # and 21.5s (first Kokoro synthesis) live, and an always-on
+                # assistant must reach "listening" immediately. A command
+                # arriving mid-warm blocks on the same lazy load it used to
+                # pay anyway — the re-armed retry window covers even that.
+                self.warm_done.clear()
+
+                def _warm_models() -> None:
+                    try:
+                        if settings.intent_warmup:
+                            print(f"Intent warm-up: {router.warm_up():.2f}s (background)")
+                        warm_tts = getattr(self.processor.tts, "warm_up", None)
+                        if settings.tts_warmup and warm_tts is not None:
+                            # Warm the model *and* preload the phrasebook: the
+                            # fixed replies are spoken from the cache, so their
+                            # synthesis never lands inside a user command (the
+                            # long ones are not cacheable by policy, which is
+                            # exactly why they were re-synthesised every time).
+                            phrases = [
+                                speakable(reply)
+                                for reply in self.processor.canned_replies()
+                            ]
+                            seconds = warm_tts(phrases=phrases)
+                            print(
+                                f"TTS warm-up: {seconds:.2f}s (background, "
+                                f"{self.processor.tts.last_preload_count} replies preloaded)"
+                            )
+                    finally:
+                        self.warm_done.set()
+
+                threading.Thread(
+                    target=_warm_models, name="model-warm", daemon=True
+                ).start()
 
         mode = "dry-run" if dry_run else "live"
         detector = getattr(self.wake_engine, "backend", "custom")
@@ -1010,8 +1270,14 @@ class NovaAgent:
                 callback=self._on_audio,
             ):
                 print("DUDE is listening. Say the wake word to begin.")
-                while True:
-                    sd.sleep(100)
+                try:
+                    while True:
+                        sd.sleep(100)
+                except KeyboardInterrupt:
+                    # Ctrl+C is how this loop normally ends. Swallow it here so
+                    # the finally block below still runs (stats + HUD shutdown)
+                    # instead of a traceback being the last thing on screen.
+                    print("\nStopping.")
         finally:
             self._stopping = True
             self.hud.set_state("idle", "Stopped")
@@ -1161,6 +1427,19 @@ def calibrate_wizard(wake_word: str | None = None) -> int:
     return wake_probe(wake_word=wake_word, attempts=5)
 
 
+def speakable(response: str) -> str:
+    """What TTS should say: the console gets full detail, speech gets prose.
+
+    Dry-run replies carry resolved paths ("Would open chrome (C:\\...)" or
+    "... at C:/work/ml"); reading those aloud made one field command run
+    24.8s of path recitation — content, but it blew the wall-clock budget
+    and nobody wants to hear a Windows path spelled out.
+    """
+    spoken = re.sub(r"\s*\([^)]*[\\/][^)]*\)", "", response)  # (C:\...)
+    spoken = re.sub(r"\s+\bat\s+[A-Za-z]:.*$", "", spoken)  # at C:/work/ml
+    return spoken.strip() or response
+
+
 def wake_prompt_for(wake_word: str) -> str | None:
     """Whisper decoding context for wake detection: the phrase as a prior.
 
@@ -1171,6 +1450,19 @@ def wake_prompt_for(wake_word: str) -> str | None:
     """
     phrase = (wake_word or "").strip().capitalize()
     return f"{phrase}. {phrase}." if phrase else None
+
+
+# Command-slot Whisper context: the same priming trick that made wake
+# transcripts reliable, pointed at the intent vocabulary instead. Field runs
+# showed unprompted Whisper-small mangling clear, loud command audio
+# ("mute the volume" -> "we hope the volume", "open python projects" ->
+# "open by 10 projects") while primed wake segments transcribed 3/3. Keep the
+# phrases aligned with config/intents.json; do not add filler the intents
+# would not want matched.
+COMMAND_PROMPT = (
+    "Open Chrome. Open my project. What time is it? "
+    "Mute the volume. Read the screen. Search the web. Set browser to Chrome."
+)
 
 
 def _wav_stats(path) -> tuple[float, float]:
@@ -1449,8 +1741,8 @@ def main() -> None:
     if args.prune_cache:
         raise SystemExit(prune_cache())
     if args.listen:
-        raise SystemExit(
-            NovaAgent(
+        try:
+            code = NovaAgent(
                 debug=args.debug,
                 stats=args.stats,
                 wake_word=args.wake_word,
@@ -1461,7 +1753,12 @@ def main() -> None:
                 hud_enabled=not args.no_hud,
                 stt_device=args.device,
             ).run()
-        )
+        except KeyboardInterrupt:
+            # Backstop for a Ctrl+C that lands before the listen loop is up
+            # (STT model load, microphone open): never a traceback on exit.
+            print("\nStopped.")
+            code = 0
+        raise SystemExit(code)
     parser.print_help()
     print("\nCommon commands:")
     print("  python -m nova_agent --listen --live        talk to Dude, really act")

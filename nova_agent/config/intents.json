@@ -35,7 +35,16 @@
   "greeting": {
     "action": "greet",
     "safe": true,
-    "examples": ["hello", "hi", "hey there", "good morning", "good afternoon"]
+    "examples": [
+      "hello",
+      "hi",
+      "hey there",
+      "good morning",
+      "good afternoon",
+      "bye",
+      "goodbye",
+      "see you later"
+    ]
   },
   "time_check": {
     "action": "time_check",
@@ -84,5 +93,25 @@
     "action": "lock_workstation",
     "safe": false,
     "examples": ["lock the computer", "lock my screen", "lock the workstation"]
+  },
+  "identity": {
+    "action": "identity",
+    "safe": true,
+    "examples": [
+      "what is your name",
+      "what's your name",
+      "who are you",
+      "what should I call you"
+    ]
+  },
+  "help": {
+    "action": "help",
+    "safe": true,
+    "examples": [
+      "help",
+      "what can you do",
+      "what can I ask you",
+      "list your commands"
+    ]
   }
 }

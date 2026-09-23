@@ -30,7 +30,7 @@ class FakeProcessor:
         self.pending_text = ""
         self.timings = {}
 
-    def transcribe(self, audio_path, prompt=None):
+    def transcribe(self, audio_path, prompt=None, hotwords=None, command=False):
         self.path_seen.append(audio_path)
         return "open chrome"
 

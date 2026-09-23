@@ -59,17 +59,36 @@ Two detectors run while `--listen` is idle, and they work differently:
   near-silence never reaches the decoder. Every exchange is visible on the
   console as it happens: `Wake detected - listening for your command.` →
   `Heard: ...` / `Intent: ...` (misses show *why*: `Heard: (nothing
-  intelligible)` or `Intent: none (best score ... below the confidence band)`)
-  → `Response: ...` (the same line that is spoken). A missed capture (empty
+  intelligible)` or `Intent: none (best score 0.51 for time_check, below the
+  confidence band)` — the runner-up intent is named, so a near miss is
+  diagnosable instead of just silent) → `Response: ...` (the same line that is
+  spoken). A missed capture (empty
   transcript or a score below the confidence band — e.g. a TV or video winning
   the first segment after a wake) **keeps the turn open** — `command_window`
   (8 s) is re-armed after *every* miss (so the pipeline's own latency can't
   consume it; `command_max_turn` caps the whole turn at 30 s) — and prints
   `Still listening for your command.`, so the real command can still arrive;
   speaking the phrase and the command in one breath
-  ("hey dude, open chrome") bypasses that race entirely. Startup prints
-  `STT warm-up` and `Intent warm-up` so the first command doesn't pay the
-  model-load tax. Because it transcribes
+  ("hey dude, open chrome") bypasses that race entirely. Boot prints
+  `STT warm-up` synchronously and then warms the intent encoder and Kokoro on
+  a **background thread** (`Intent warm-up: 21.3s (background)`,
+  `TTS warm-up: 6.2s (background, 9 replies preloaded)`), so the
+  listener is up immediately while command #1 doesn't pay the ~21s-per-model
+  load tax. Command captures — and confirmation replies — transcribe with a
+  command-vocabulary prompt (`COMMAND_PROMPT`), the same priming that made the
+  wake phrase reliable; unprompted Whisper-small was mangling clear commands in
+  the field (`mute the volume` → `we hope the volume`, `open python projects`
+  → `open by 10 projects`). `--stats` latency budgets are field-calibrated
+  over three rounds (stt 3s, intent 0.2s, tts 2.5s for synthesis-to-audio
+  only, action 0.5s, total 15s — total is wall clock and includes *speaking*
+  the reply, but never a filesystem path: `speakable()` keeps `C:\...` on the
+  console only). Commands that *start* while the background warm-up still
+  holds the model loads are excluded from the stats (they block by design —
+  a boot-window command pinned intent at 19088ms; the verdict is taken at
+  start, since such a command can outlive warm blocked on the TTS synthesis
+  lock), and each command's stage timings reset at capture so a wake-segment
+  transcription can't leak into its stats row.
+  Because it transcribes
   idle speech, expect Whisper CPU use whenever someone nearby is talking; set
   `NOVA_TRANSCRIPT_WAKE=0` to turn it off.
 - **Audio model (secondary)** — `assets/wake_word/hey_nova.onnx` scores every
@@ -92,7 +111,21 @@ results through the real pipeline.
 | "mute the volume", "turn up the sound" | Multimedia volume keys |
 | "read the screen", "what does this say" | OCR of the current screen |
 | "open my ml project" | Opens a folder remembered in SQLite |
-| "hello", "what time is it" | Small talk and the clock |
+| "open notepad", "open excel", "open notepadd" | Any installed app (PATH, then Start Menu shortcuts, then a close-name match) |
+| "hello", "bye", "what time is it" | Small talk, farewells, and the clock |
+| "what's your name", "who are you" | Says who it is |
+| "what can you do", "help" | Lists what is actually enabled |
+| "open" (no app named) | Asks **"Open what?"** — never opens a default app |
+
+Two rules keep the guessing out of the pipeline:
+
+- **A launch verb with no app asks instead of acting.** "open" alone used to
+  match the example *inside* "open chrome" and launch the browser; now the turn
+  stays open and the answer ("notepad") is understood as the app it named.
+- **A misheard name must still be a real app.** Resolution is exact first, then
+  PATH, then Start Menu shortcuts, then a *conservative* closest-name match
+  (≥4 characters, 0.82 similarity), and anything else gets the honest
+  "I don't know how to open X yet." — never a guess.
 
 Wake word, hands-free capture, and everything above are wired through a worker
 thread, so microphone frames are never dropped while Whisper or Kokoro runs, and
@@ -113,8 +146,22 @@ Dude cannot trigger itself on its own speech.
 | `NOVA_CODE_PATH` | `%LOCALAPPDATA%` | VS Code executable |
 
 Tunables live in `nova_agent/config/settings.py` (wake phrase: `wake_word`,
-default `"hey dude"`); the 15 task definitions live in
+default `"hey dude"`); the 17 task definitions live in
 `nova_agent/config/intents.json`.
+
+Command captures are primed twice for Whisper: an `initial_prompt` built from
+the intent vocabulary (`COMMAND_PROMPT`) and a `hotwords` hint holding the app
+names this install understands (the intent examples' app words plus any alias
+taught with "set browser to ..."). Whisper has no way to guess a name it has
+never seen — without it, "open notepad" can come back as "open note pad" or
+worse. Wake and confirmation captures deliberately get **no** hotwords: biasing
+a "yes" toward an app name would cancel confirmations.
+
+Kokoro replies are cached (short, digit-free phrases only, so dynamic text
+cannot bloat the cache) and the cache is *preloaded* during the background TTS
+warm-up with the assistant's fixed replies — `CommandProcessor.canned_replies()`,
+which includes the long ones the cache policy would otherwise refuse to store
+(the screen-reading failure used to cost 2.7 s of synthesis on every use).
 
 ## Optional Windows tools
 

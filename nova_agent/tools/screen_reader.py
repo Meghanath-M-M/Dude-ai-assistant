@@ -1,3 +1,11 @@
+# The exact text the dispatcher speaks when OCR is missing. Kept here so the
+# raised error and the TTS preload phrasebook cannot drift apart — the spoken
+# form is cached, so it has to match character for character.
+TESSERACT_MISSING_MESSAGE = (
+    "Tesseract OCR is not installed. Install it and set NOVA_TESSERACT_PATH."
+)
+
+
 def _tesseract_available(pytesseract_module) -> bool:
     """Report whether the Tesseract binary can actually be executed.
 
@@ -24,9 +32,7 @@ def read_screen(tesseract_path: str | None = None, max_characters: int = 500) ->
     if tesseract_path:
         pytesseract.pytesseract.tesseract_cmd = tesseract_path
     if not _tesseract_available(pytesseract):
-        raise RuntimeError(
-            "Tesseract OCR is not installed. Install it and set NOVA_TESSERACT_PATH."
-        )
+        raise RuntimeError(TESSERACT_MISSING_MESSAGE)
     image = ImageGrab.grab()
     text = pytesseract.image_to_string(image).strip()
     if not text:

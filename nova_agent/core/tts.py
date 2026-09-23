@@ -1,6 +1,9 @@
 import os
 import re
 import tempfile
+import threading
+import time
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -26,6 +29,58 @@ class TTSEngine:
         self.max_cache_words = max_cache_words
         self.max_cache_characters = max_cache_characters
         self._pipeline = None
+        self._pipeline_lock = threading.Lock()
+        # Self-reported time-to-speech for the stats stage: set per synthesis,
+        # reset by every speak() so a cache hit honestly reports ~0 (audio
+        # starts immediately) instead of a stale value.
+        self.last_synthesis_seconds: float = 0.0
+        # How many canonical replies the last preload had to synthesise.
+        self.last_preload_count: int = 0
+
+    def warm_up(self, phrases: Iterable[str] = ()) -> float:
+        """Build the pipeline, pay the first-synthesis tax, cache ``phrases``.
+
+        The very first synthesis imports kokoro, loads the model, and runs
+        torch's JIT pass — measured live at 21.5s inside the tts stage of the
+        first command (warm syntheses land near 2.1s, plus playback).
+
+        ``phrases`` are the assistant's canonical replies (see ``preload``);
+        caching them here is what keeps their synthesis out of a user command.
+        """
+        started = time.perf_counter()
+        self._synthesize("Warm up.")
+        self.preload(phrases)
+        return time.perf_counter() - started
+
+    def preload(self, phrases: Iterable[str]) -> int:
+        """Cache canonical reply phrases; returns how many were synthesised.
+
+        ``should_cache``'s length policy exists because *dynamic* replies (a
+        clock reading, "open <whatever>") would grow the cache without bound and
+        are never said twice. The assistant's fixed replies are the opposite
+        case, and the longest of them is the worst: the 15-word "screen reading
+        is unavailable ..." reply cost 2669ms of synthesis against a 2500ms tts
+        budget — on *every* use, because the policy refused to cache it. Storing
+        canonical replies whatever their length turns that into a file read, and
+        ``speak`` consults the cache before the policy, so they stay served.
+
+        Entries already on disk are skipped on purpose: a second boot must not
+        re-synthesise the whole phrasebook.
+        """
+        from scipy.io import wavfile
+
+        created = 0
+        for phrase in dict.fromkeys(phrases):  # de-duplicate, keep the order
+            text = (phrase or "").strip()
+            if not text:
+                continue
+            path = self._cache_path(text)
+            if path.exists():
+                continue
+            self._write_cache(wavfile, path, self._synthesize(text))
+            created += 1
+        self.last_preload_count = created
+        return created
 
     def should_cache(self, text: str) -> bool:
         """Only short, stable phrases are worth keeping on disk."""
@@ -38,6 +93,7 @@ class TTSEngine:
 
     def speak(self, text: str) -> None:
         """Play ``text`` using the cache, a cached prefix, or fresh synthesis."""
+        self.last_synthesis_seconds = 0.0  # cache hits truly start instantly
         try:
             import sounddevice as sd
         except ImportError as exc:
@@ -73,20 +129,26 @@ class TTSEngine:
         sd.wait()
 
     def _synthesize(self, text: str):
-        if self._pipeline is None:
-            try:
-                from kokoro import KPipeline
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Live TTS requires kokoro. Install requirements.txt first."
-                ) from exc
-            self._pipeline = KPipeline(lang_code="a")
+        # One lock around build *and* synthesis: the background warm thread
+        # and the first live reply raced into two KPipeline builds (observed
+        # as two repo_id warnings and double the load time).
+        with self._pipeline_lock:
+            started = time.perf_counter()
+            if self._pipeline is None:
+                try:
+                    from kokoro import KPipeline
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Live TTS requires kokoro. Install requirements.txt first."
+                    ) from exc
+                self._pipeline = KPipeline(lang_code="a")
 
-        for _, _, audio in self._pipeline(text, voice=self.voice):
-            normalized = self._normalize_audio(audio)
-            if normalized.size:
-                return normalized
-        raise RuntimeError("Kokoro returned no audio for the requested text.")
+            for _, _, audio in self._pipeline(text, voice=self.voice):
+                normalized = self._normalize_audio(audio)
+                if normalized.size:
+                    self.last_synthesis_seconds = time.perf_counter() - started
+                    return normalized
+            raise RuntimeError("Kokoro returned no audio for the requested text.")
 
     def _read_wav(self, path: Path):
         """Read a cached WAV, discarding entries that are no longer readable."""

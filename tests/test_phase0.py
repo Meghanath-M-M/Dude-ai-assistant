@@ -9,17 +9,19 @@ from nova_agent.core.intent_router import IntentRouter
 from nova_agent.core.safety import requires_confirmation
 from nova_agent.core.stt import STTEngine
 from nova_agent.core.tts import TTSEngine
-from nova_agent.main import CommandProcessor
+from nova_agent.main import CommandProcessor, speakable
 
 
 def test_intents_load():
     router = IntentRouter(intents_path=INTENTS_PATH)
 
-    assert len(router.intents) == 15
+    assert len(router.intents) == 17
     assert "read_screen" in router.intents
     assert "greeting" in router.intents
     assert "time_check" in router.intents
     assert "repeat_last" in router.intents
+    assert "identity" in router.intents
+    assert "help" in router.intents
     assert "set_project" in router.intents
     assert "set_browser" in router.intents
     assert "set_preference" in router.intents
@@ -65,6 +67,181 @@ def test_warm_up_loads_the_encoder_before_the_first_match():
     assert elapsed >= 0.0
 
 
+def test_prepare_embeddings_loads_once_under_concurrent_first_use(monkeypatch):
+    """The background warm thread and the first live match can race in."""
+    import sys
+    import threading
+    import time as time_module
+    import types
+
+    constructions: list[str] = []
+
+    class SlowEncoder:
+        def __init__(self, _name):
+            constructions.append(_name)
+            time_module.sleep(0.05)  # long enough for racing threads to enter
+
+        def encode(self, texts, normalize_embeddings=True):
+            return np.ones((len(texts), 3))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        types.SimpleNamespace(SentenceTransformer=SlowEncoder),
+    )
+    router = IntentRouter(intents_path=INTENTS_PATH)
+
+    threads = [threading.Thread(target=router._prepare_embeddings) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(constructions) == 1
+
+
+def test_tts_warm_up_prepays_the_first_synthesis(monkeypatch, tmp_path):
+    engine = TTSEngine(cache_dir=tmp_path)
+    synthesized: list[str] = []
+    monkeypatch.setattr(engine, "_synthesize", lambda text: synthesized.append(text))
+
+    elapsed = engine.warm_up()
+
+    assert synthesized  # the import + model-load + JIT tax is paid here...
+    assert elapsed >= 0.0  # ...so the first real speak() doesn't pay it
+
+
+def test_tts_preload_caches_a_reply_the_policy_would_reject(monkeypatch, tmp_path):
+    """The long fixed replies are exactly the ones `should_cache` skips."""
+    from nova_agent.tools.screen_reader import TESSERACT_MISSING_MESSAGE
+
+    engine = TTSEngine(cache_dir=tmp_path)
+    synthesized: list[str] = []
+
+    def fake_synthesize(text):
+        synthesized.append(text)
+        return np.ones(8, dtype=np.float32)
+
+    monkeypatch.setattr(engine, "_synthesize", fake_synthesize)
+    reply = f"Screen reading is unavailable. {TESSERACT_MISSING_MESSAGE}"
+
+    assert engine.should_cache(reply) is False  # >6 words: never cached on use
+    assert engine.preload([reply, "", reply]) == 1  # de-duplicated, blanks skipped
+
+    assert engine._cache_path(reply).exists()
+    assert synthesized == [reply]
+
+    # A second boot must not re-synthesise the whole phrasebook.
+    assert engine.preload([reply]) == 0
+    assert engine.last_preload_count == 0
+
+
+def test_a_preloaded_reply_is_served_from_the_cache(monkeypatch, tmp_path):
+    """The tts-budget fix: a preloaded reply is a file read, not a synthesis."""
+    import sys
+    import types
+
+    from nova_agent.tools.screen_reader import TESSERACT_MISSING_MESSAGE
+
+    engine = TTSEngine(cache_dir=tmp_path)
+    synthesized: list[str] = []
+
+    def fake_synthesize(text):
+        synthesized.append(text)
+        return np.ones(8, dtype=np.float32)
+
+    monkeypatch.setattr(engine, "_synthesize", fake_synthesize)
+    played: list[int] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        types.SimpleNamespace(
+            play=lambda data, rate: played.append(len(data)),
+            wait=lambda: None,
+        ),
+    )
+    reply = f"Screen reading is unavailable. {TESSERACT_MISSING_MESSAGE}"
+    engine.preload([reply])
+
+    engine.speak(reply)
+
+    assert played  # audio came out of the cache
+    assert engine.last_synthesis_seconds == 0.0  # so the tts stage reports ~0ms
+    assert synthesized == [reply]  # and nothing was synthesised twice
+
+
+def test_warm_up_preloads_the_phrasebook(monkeypatch, tmp_path):
+    engine = TTSEngine(cache_dir=tmp_path)
+    synthesized: list[str] = []
+
+    def fake_synthesize(text):
+        synthesized.append(text)
+        return np.ones(8, dtype=np.float32)
+
+    monkeypatch.setattr(engine, "_synthesize", fake_synthesize)
+
+    engine.warm_up(phrases=["Hello there.", "Hello there."])
+
+    assert synthesized == ["Warm up.", "Hello there."]
+    assert engine.last_preload_count == 1
+
+
+def test_command_captures_are_transcribed_with_the_command_prompt():
+    from nova_agent.main import COMMAND_PROMPT
+
+    prompts: list = []
+
+    class RecordingSTT:
+        def transcribe(self, _audio_path, prompt=None, hotwords=None):
+            prompts.append(prompt)
+            return "open chrome"
+
+    class NeverRouter:
+        def match(self, _text):
+            return None, 0.0
+
+    class QuietTTS:
+        def speak(self, _message):
+            pass
+
+    processor = CommandProcessor(RecordingSTT(), NeverRouter(), QuietTTS())
+    processor.process("command.wav")
+
+    assert prompts == [COMMAND_PROMPT]
+
+
+def test_the_kokoro_pipeline_builds_once_under_concurrent_use(monkeypatch, tmp_path):
+    """The background warm thread and the first live reply must not double-build."""
+    import sys
+    import threading
+    import time as time_module
+    import types
+
+    constructions: list = []
+
+    class SlowPipeline:
+        def __init__(self, lang_code):
+            constructions.append(lang_code)
+            time_module.sleep(0.05)  # long enough for racing threads to enter
+
+        def __call__(self, text, voice=None):
+            yield None, None, np.ones(8, dtype=np.float32)
+
+    monkeypatch.setitem(
+        sys.modules, "kokoro", types.SimpleNamespace(KPipeline=SlowPipeline)
+    )
+    engine = TTSEngine(cache_dir=tmp_path)
+
+    threads = [threading.Thread(target=engine._synthesize, args=("hi",)) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(constructions) == 1
+    assert engine.last_synthesis_seconds >= 0.0
+
+
 def test_intent_router_matches_time_queries():
     router = IntentRouter(intents_path=INTENTS_PATH)
     intent, score = router.match("what time is it")
@@ -78,7 +255,7 @@ class FakeSTT:
     def __init__(self, text):
         self.text = text
 
-    def transcribe(self, _audio_path, prompt=None):
+    def transcribe(self, _audio_path, prompt=None, hotwords=None):
         return self.text
 
 
@@ -109,7 +286,7 @@ def test_phase1_open_app_pipeline_stays_dry_run():
     response = processor.process("command.wav")
 
     assert response.startswith("Would open chrome")
-    assert tts.messages == [response]
+    assert tts.messages == [speakable(response)]  # full detail printed, path never spoken
 
 
 def test_phase1_search_pipeline_stays_dry_run():
@@ -258,3 +435,56 @@ def test_command_processor_reports_a_missing_tesseract_binary(monkeypatch):
     response = processor.process("command.wav")
 
     assert response == "Screen reading is unavailable. Tesseract OCR is not installed."
+
+
+def test_lexical_fallback_refuses_one_character_fragments():
+    """A bare "i" must never claim an example — field run opened VS Code on it."""
+    router = IntentRouter(intents_path=INTENTS_PATH)
+
+    intent, score = router._lexical_fallback("i")
+
+    assert intent is None
+    assert score == 0.0
+
+
+def test_lexical_fallback_claims_launch_verb_plus_unknown_app():
+    router = IntentRouter(intents_path=INTENTS_PATH)
+
+    intent, score = router._lexical_fallback("open gallery")
+
+    assert intent["action"] == "open_app"
+    assert score == 0.75
+
+
+def test_lexical_fallback_still_prefers_project_shape_over_generic_open():
+    router = IntentRouter(intents_path=INTENTS_PATH)
+
+    intent, _score = router._lexical_fallback("open my new project")
+
+    assert intent["action"] == "context_open"
+
+
+def test_intent_router_matches_farewell():
+    router = IntentRouter(intents_path=INTENTS_PATH)
+
+    intent, score = router.match("bye")
+
+    assert intent is not None
+    assert intent["action"] == "greet"
+    assert score >= 0.75
+
+
+def test_greet_replies_with_a_farewell_for_bye():
+    processor = CommandProcessor(FakeSTT("bye"), FakeRouter({"action": "greet"}), FakeTTS())
+
+    assert processor.process("command.wav") == "Goodbye. Talk to you soon."
+
+
+def test_speakable_drops_paths_from_spoken_replies():
+    assert (
+        speakable(r"Would open chrome (C:\Program Files\Google\Chrome\chrome.exe)")
+        == "Would open chrome"
+    )
+    assert speakable("Would open project ml at C:/work/ml") == "Would open project ml"
+    assert speakable("I didn't catch that") == "I didn't catch that"
+    assert speakable("Good evening. How can I help?") == "Good evening. How can I help?"

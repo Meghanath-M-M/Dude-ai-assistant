@@ -10,7 +10,7 @@ class FakeSTT:
     def __init__(self, text):
         self.text = text
 
-    def transcribe(self, _audio_path, prompt=None):
+    def transcribe(self, _audio_path, prompt=None, hotwords=None):
         return self.text
 
 

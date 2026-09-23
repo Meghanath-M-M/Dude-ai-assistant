@@ -9,7 +9,7 @@ the pending one, not thrown away.
 from pathlib import Path
 
 from nova_agent.core.context_engine import ContextEngine
-from nova_agent.main import MAX_COMMAND_SWAPS, CommandProcessor, NovaAgent
+from nova_agent.main import MAX_COMMAND_SWAPS, CommandProcessor, NovaAgent, speakable
 
 CLOSE = {"action": "close_window", "safe": False}
 LOCK = {"action": "lock_workstation", "safe": False}
@@ -20,7 +20,7 @@ class FakeSTT:
     def __init__(self, text):
         self.text = text
 
-    def transcribe(self, _audio_path, prompt=None):
+    def transcribe(self, _audio_path, prompt=None, hotwords=None):
         return self.text
 
 
@@ -102,8 +102,9 @@ def test_reply_that_is_a_new_command_replaces_the_pending_one(tmp_path):
     assert processor.pending_confirmation is None
     assert "chrome" in response.lower()
     # The confirmation prompt was spoken first, the replacement's reply last.
+    # Speech gets the path-stripped form; the full response keeps the path.
     assert processor.tts.messages[0].startswith("About to close")
-    assert processor.tts.messages[-1] == response
+    assert processor.tts.messages[-1] == speakable(response) == "Would open chrome"
 
 
 def test_a_clear_no_cancels_the_pending_command(tmp_path):
@@ -124,7 +125,7 @@ def test_yes_still_runs_the_pending_command(tmp_path):
     assert processor.pending_confirmation is None
     assert response != "Cancelled"
     assert "close" in response.lower()
-    assert processor.tts.messages[-1] == response
+    assert processor.tts.messages[-1] == speakable(response)
 
 
 def test_an_unreadable_reply_still_cancels(tmp_path):

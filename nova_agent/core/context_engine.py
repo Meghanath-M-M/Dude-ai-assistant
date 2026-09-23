@@ -53,6 +53,14 @@ class ContextEngine:
         ).fetchone()
         return row[0] if row else None
 
+    def list_aliases(self) -> list[tuple[str, str]]:
+        """Every remembered alias as ``(alias, app_key)``.
+
+        Used to build the STT name vocabulary: an alias the user taught
+        ("browser" -> edge) is a word the model should expect to hear.
+        """
+        return self.connection.execute("SELECT alias, app_key FROM app_aliases").fetchall()
+
     def resolve_app(self, name: str) -> str:
         """Map a spoken app name onto a configured executable key."""
         candidate = (name or "").strip().lower()

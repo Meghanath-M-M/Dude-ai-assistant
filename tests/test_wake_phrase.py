@@ -99,7 +99,7 @@ class FakeProcessor:
         self.pending_text = ""
         self.timings = {}
 
-    def transcribe(self, audio_path, prompt=None):
+    def transcribe(self, audio_path, prompt=None, hotwords=None, command=False):
         self.transcribed.append(audio_path)
         self.prompts.append(prompt)
         return next(self._transcripts)
@@ -202,7 +202,7 @@ def test_an_failing_idle_transcription_does_not_kill_the_loop():
             super().__init__([])
             self.stt = ExplodingSTT()
 
-        def transcribe(self, audio_path, prompt=None):
+        def transcribe(self, audio_path, prompt=None, hotwords=None, command=False):
             raise RuntimeError("whisper exploded")
 
     agent = NovaAgent(

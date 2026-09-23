@@ -54,9 +54,11 @@ class Settings:
     stt_device: str = DEFAULT_STT_DEVICE
     stt_compute_type: str = "int8"
     stt_warmup: bool = True
-    # sentence-transformers loads lazily on the first router match; warm it
-    # at startup so command #1 doesn't pay a ~10s import+load tax.
+    # sentence-transformers and Kokoro load lazily; at listen startup both are
+    # warmed on a background thread so boot reaches "listening" immediately
+    # while the ~21s-per-model load tax stays off command #1.
     intent_warmup: bool = True
+    tts_warmup: bool = True
     intent_threshold: float = 0.82
     # The phrase the assistant answers to. The ONNX sound model is trained
     # for a fixed phrase of its own; this is what transcript wake matches on.

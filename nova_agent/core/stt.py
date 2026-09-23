@@ -42,16 +42,33 @@ class STTEngine:
             return 0.0
         return time.perf_counter() - started
 
-    def transcribe(self, audio_path: str, prompt: str | None = None) -> str:
+    def transcribe(
+        self,
+        audio_path: str,
+        prompt: str | None = None,
+        hotwords: str | None = None,
+    ) -> str:
         """Transcribe a wav; ``prompt`` seeds Whisper's decoding context.
 
         Wake detection primes this with the wake phrase: short two-word
         utterances otherwise fall into Whisper's generic priors on some
         voices ("what are you doing?" for "hey dude").
+
+        ``hotwords`` carries the command slot's *name* vocabulary. Whisper has
+        no reason to think "notepad" or "vscode" is a word, so the names the
+        user actually says go in as a decode hint — faster-whisper's own
+        parameter, and the same technique Home Assistant's Whisper server uses
+        for entity names (its author measured that even 50 unrelated names cost
+        nothing on general speech). Left None for wake and confirmation
+        captures, where biasing toward app names would work against the phrase
+        being listened for.
+
+        Long input is safe: faster-whisper truncates the hint to half the
+        model's text context.
         """
         started = time.perf_counter()
         try:
-            segments = self._collect_segments(audio_path, prompt)
+            segments = self._collect_segments(audio_path, prompt, hotwords)
         except RuntimeError as exc:
             if self.device != "cuda" or "cublas" not in str(exc).lower():
                 raise
@@ -67,15 +84,25 @@ class STTEngine:
                 device=self.device,
                 compute_type=self.compute_type,
             )
-            segments = self._collect_segments(audio_path, prompt)
+            segments = self._collect_segments(audio_path, prompt, hotwords)
         self.last_duration = time.perf_counter() - started
         return " ".join(segment.text for segment in segments).strip().lower()
 
-    def _collect_segments(self, audio_path: str, prompt: str | None = None):
-        segments, _ = self._run_transcription(audio_path, prompt)
+    def _collect_segments(
+        self,
+        audio_path: str,
+        prompt: str | None = None,
+        hotwords: str | None = None,
+    ):
+        segments, _ = self._run_transcription(audio_path, prompt, hotwords)
         return list(segments)
 
-    def _run_transcription(self, audio_path: str, prompt: str | None = None):
+    def _run_transcription(
+        self,
+        audio_path: str,
+        prompt: str | None = None,
+        hotwords: str | None = None,
+    ):
         return self.model.transcribe(
             audio_path,
             language="en",
@@ -84,4 +111,5 @@ class STTEngine:
             vad_filter=True,
             condition_on_previous_text=False,
             initial_prompt=prompt,
+            hotwords=hotwords,
         )

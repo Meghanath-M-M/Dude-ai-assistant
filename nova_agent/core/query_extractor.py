@@ -196,6 +196,13 @@ def extract_app_phrase(text: str) -> str | None:
     for phrase in sorted(APP_WORDS, key=len, reverse=True):
         if re.search(rf"\b{re.escape(phrase)}\b", normalized):
             return phrase
+    # Unknown app: keep whatever followed the launch verb so the dispatcher
+    # can resolve it ("open gallery" -> "gallery") instead of refusing the
+    # whole command before it ever reaches the resolver.
+    for trigger in sorted(APP_TRIGGERS, key=len, reverse=True):
+        if normalized == trigger or normalized.startswith(f"{trigger} "):
+            remainder = normalized[len(trigger) :].strip(_TRAILING_PUNCTUATION)
+            return remainder or None
     return None
 
 

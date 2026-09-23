@@ -66,12 +66,72 @@ There is no typechecker, no CI workflow, no pre-commit config. Verification is
   defaults), not per-call. Restart the process to change them.
 - `ContextEngine()` defaults to CWD-relative `memory/nova.db`, while `settings.DATABASE_PATH`
   is repo-root anchored. Running from another CWD silently creates a second database.
+- App opening is a resolution chain: `extract_app_phrase` (known alias first,
+  then the trailing phrase of a launch verb) → `context.get_alias` →
+  `APP_PATHS` (chrome/code) → `tools/app_controller.resolve_app` (PATH, then
+  Start Menu `.lnk`, then a deliberately conservative closest-name match:
+  `FUZZY_MIN_LENGTH`/`FUZZY_CUTOFF`, ≥4 chars and 0.82 ratio, so "notepadd"
+  finds Notepad while "notes" does not), else an honest "I don't know how to
+  open X yet."
+  `set browser` accepts any name the same resolver can find (it used to
+  whitelist only chrome/code), so "set browser to edge" sticks.
+  A launch verb with **no** app at all (bare "open.", where `extract_app_phrase`
+  returns None and the intent has no `target`) asks `OPEN_WHAT_RESPONSE`
+  ("Open what?") and sets `CommandProcessor.pending_clarification`; the next
+  capture is then dispatched as `open <answer>` instead of being read as a new
+  command. `RETRY_RESPONSES` (miss **and** the question) keeps that turn open in
+  `NovaAgent._finish_turn`. Defaulting to chrome there was the field bug where
+  `Heard: open.` opened the browser.
+- `CommandProcessor.transcribe(..., command=True)` is the *only* slot that gets
+  STT `hotwords` (`stt_hotwords()`: app words + resolver aliases + remembered
+  aliases). Wake segments and confirmation replies must not get them — a "yes"
+  decoded as an app name cancels a confirmation. `hotwords` is faster-whisper's
+  own parameter (prompt-token biasing, auto-truncated to half the text context).
+- TTS caching has two tiers, and the difference matters for the `tts` latency
+  stage: `should_cache` governs *dynamic* replies (≤6 words, ≤60 chars, no
+  digits) so they cannot bloat the cache, while `TTSEngine.preload(phrases)`
+  stores the fixed replies from `CommandProcessor.canned_replies()` whatever
+  their length, during the background warm-up (`warm_up(phrases=...)`). `speak`
+  reads the cache *before* consulting the policy, so a preloaded reply reports
+  `last_synthesis_seconds == 0` — that is the whole reason the 15-word
+  screen-reading failure stopped blowing the 2.5 s `tts` budget. Preload skips
+  entries already on disk (no re-synthesis on later boots). The screen-reading
+  string is single-sourced in `tools/screen_reader.py`
+  (`TESSERACT_MISSING_MESSAGE`) because the cached key must match exactly.
+  `_respond` prints the full response but speaks `speakable(response)` —
+  filesystem paths are console detail, never read aloud. `--stats` skips
+  commands that **start** while `NovaAgent.warm_done` is clear (background
+  warm-up in flight) so boot-window artifacts don't pin the worst-case
+  verdict — the verdict is taken at command *start* because a mid-warm
+  command can outlive warm blocked on the TTS synthesis lock. `_run_captured`
+  also resets `processor.timings` per command so the wake-segment
+  transcription can't leak into a text-path command's snapshot.
+- `_lexical_fallback` claims on **whole words only** and refuses
+  normalizations shorter than 2 chars — raw substring matching let a bare
+  "i" claim "launch visual studio code" and open VS Code from noise (field
+  round 3). A launch verb plus an unknown app claims `open_app` at 0.75
+  after all specific shapes (project/volume/examples) have had their turn.
+  Two field-round-5 guards sit around that loop: a normalization made *only* of
+  launch verbs (`LAUNCH_WORDS`) returns `open_app` with no target instead of
+  matching `\bopen\b` inside the example "open chrome", and a `TIME_WORDS` token
+  claims `time_check` *after* the example loop (so "it's time to open chrome"
+  still opens Chrome). `IntentRouter.match` also records `last_best_label`, which
+  the miss line prints so a near miss names the intent it nearly matched.
+- The HUD is the one component that owns a Qt thread. `NovaHUD.stop()` only
+  *requests* a stop (`_stop_requested`, polled by a QTimer on the Qt thread);
+  calling `app.quit()` from the caller's thread produced
+  "QObject::killTimer: Timers cannot be stopped from another thread" on every
+  exit. `_silence_benign_qt_messages()` drops exactly Qt's "QApplication was not
+  created in the main() thread" advisory (the overlay cannot live on the main
+  thread — that thread is in the sounddevice loop) and forwards every other Qt
+  message. Ctrl+C is swallowed inside `run()` so the `finally` (stats + HUD
+  shutdown) still runs, with a `KeyboardInterrupt` backstop in `main()`.
 
 ## Testing quirks
 
 - Tests inject fakes: `CommandProcessor(FakeSTT, FakeRouter, FakeTTS)` — follow that
   pattern; no test needs a microphone or GPU.
-- Tests hard-code counts/names: `len(router.intents) == 15`, risky intents ==
+- Tests hard-code counts/names: `len(router.intents) == 17`, risky intents ==
   `{close_window, tidy_downloads, lock_workstation}` (both in `tests/test_phase0.py`).
   Adding or renaming an intent in `intents.json` requires updating those tests and
   `IMPLEMENTED_ACTIONS`.

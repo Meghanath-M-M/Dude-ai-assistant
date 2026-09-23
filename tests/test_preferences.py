@@ -44,7 +44,7 @@ def test_router_sends_preference_phrases_to_the_new_intent():
 
 
 class FakeSTT:
-    def transcribe(self, _audio_path, prompt=None):
+    def transcribe(self, _audio_path, prompt=None, hotwords=None):
         return ""
 
 
