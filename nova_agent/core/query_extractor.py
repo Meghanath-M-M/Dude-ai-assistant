@@ -87,6 +87,27 @@ PRONOUN_TARGETS = {
     "anything",
 }
 
+# Conjunctions that join two independent commands. A claim on the first half
+# used to swallow the rest — the field log "increase brightness and open
+# microsoft edge" raised the brightness and silently dropped the launch.
+COMPOUND_SPLIT = re.compile(r"\s+(?:and then|then|and|as well as)\s+", re.IGNORECASE)
+
+# Even a real split can over-fire; three clauses is the most one utterance
+# can sensibly carry, so a conjunction-stuffed phrase cannot queue a storm.
+MAX_COMPOUND_CLAUSES = 3
+
+
+def split_compound(text: str) -> list[str]:
+    """Split an utterance on command-joining conjunctions.
+
+    Returns every clause — a single clause when there is nothing to split.
+    Callers only treat the result as compound when *multiple* clauses match an
+    intent; otherwise the whole phrase is routed as one command, so "please
+    and open chrome" (or "search for rust and ownership") keeps working.
+    """
+    clauses = [part.strip() for part in COMPOUND_SPLIT.split(text or "") if part.strip()]
+    return clauses[:MAX_COMPOUND_CLAUSES]
+
 SET_PROJECT_PATTERNS = (
     re.compile(r"set (?:the )?(?:project|folder) (?P<name>.+?) to (?P<path>.+)$"),
     re.compile(r"set (?P<name>.+?) project to (?P<path>.+)$"),

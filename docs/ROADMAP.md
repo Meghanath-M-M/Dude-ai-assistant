@@ -449,9 +449,23 @@ thread` plus `QObject::killTimer: Timers cannot be stopped from another thread`.
   an OSError fallback, and a double failure answers "I couldn't open X."
   instead of raising into the listen loop. Dry-run had hidden this: every
   earlier field round stopped at "Would open chrome".
+- **Round-7 (field): compound commands + long names** — `increase brightness
+  and open microsoft edge` raised the brightness and silently dropped the
+  launch: the `BRIGHTNESS_WORDS` claim took the whole sentence. `observe` now
+  splits on conjunctions (`split_compound`, capped at 3 clauses) and matches
+  clause by clause; only *two* matching clauses stand as a compound, otherwise
+  the whole phrase routes exactly as before. Follow-ups queue in
+  `pending_compound` and run in turn through `run_observation`, pausing behind
+  any spoken confirmation (a rejection drops them with the pending action);
+  `join_replies` merges the per-clause answers into one spoken response, and
+  `--stats` sums their action time. The same log's "you need to add a long
+  name" landed as multi-word Start Menu names (`multi_word_shortcut_names`)
+  biased into the command slot's `stt_hotwords()` — long names are the ones
+  Whisper mangles; single-word stems stay out of that prompt budget.
 
-Verification: `python -m pytest` 237 passed (+16 in
-`tests/test_brightness.py`, +5 launch tests in `tests/test_app_resolution.py`;
-the round-5 follow-up before it added `tests/test_volume.py` and the
-pronoun/recache coverage), the intent count/membership asserted at 18 in
-`tests/test_phase0.py`, `python -m ruff check .` clean.
+Verification: `python -m pytest` 244 passed (+7 in `tests/test_compound.py`,
++16 in `tests/test_brightness.py`, +5 launch tests in
+`tests/test_app_resolution.py`; the round-5 follow-up before it added
+`tests/test_volume.py` and the pronoun/recache coverage), the intent
+count/membership asserted at 18 in `tests/test_phase0.py`, `python -m ruff
+check .` clean.

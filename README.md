@@ -117,6 +117,7 @@ results through the real pipeline.
 | "hello", "bye", "what time is it" | Small talk, farewells, and the clock |
 | "what's your name", "who are you" | Says who it is |
 | "what can you do", "help" | Lists what is actually enabled |
+| "increase brightness and open microsoft edge" | Compound commands run every matching clause in turn (risky clauses still ask first) |
 | "open" (no app named) | Asks **"Open what?"** — never opens a default app |
 
 Two rules keep the guessing out of the pipeline:
@@ -148,13 +149,15 @@ Dude cannot trigger itself on its own speech.
 | `NOVA_CODE_PATH` | `%LOCALAPPDATA%` | VS Code executable |
 
 Tunables live in `nova_agent/config/settings.py` (wake phrase: `wake_word`,
-default `"hey dude"`); the 17 task definitions live in
+default `"hey dude"`); the 18 task definitions live in
 `nova_agent/config/intents.json`.
 
 Command captures are primed twice for Whisper: an `initial_prompt` built from
 the intent vocabulary (`COMMAND_PROMPT`) and a `hotwords` hint holding the app
-names this install understands (the intent examples' app words plus any alias
-taught with "set browser to ..."). Whisper has no way to guess a name it has
+names this install understands (the intent examples' app words, any alias
+taught with "set browser to ...", and the long multi-word Start Menu names
+like "microsoft edge" — the ones Whisper mangles). Whisper has no way to
+guess a name it has
 never seen — without it, "open notepad" can come back as "open note pad" or
 worse. Wake and confirmation captures deliberately get **no** hotwords: biasing
 a "yes" toward an app name would cancel confirmations.

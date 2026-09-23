@@ -56,6 +56,13 @@ There is no typechecker, no CI workflow, no pre-commit config. Verification is
   `check_environment`/`calibrate_microphone`/`wake_probe` helpers.
   `handle_command(audio_path=None, ..., text=...)` skips transcription when the
   text is already known (transcript-wake one-shot commands).
+  `observe` splits a compound utterance ("increase brightness and open
+  microsoft edge") on conjunctions (`split_compound`, capped at 3 clauses) and
+  queues follow-up clauses in `pending_compound` — but only when *two* clauses
+  match an intent, so "please and open chrome" still routes whole;
+  `run_observation` runs the queue in turn (one `_respond` per call via
+  `join_replies`), pausing whenever a clause needs its own spoken confirmation,
+  and sums clause action times for `--stats`.
 - `nova_agent/core/wake_phrase.py` = pure transcript matcher (normalize +
   word-boundary hit + remainder extraction); `core/` otherwise = pipeline stages;
   `tools/` = side-effecting Windows actions;
@@ -92,7 +99,10 @@ There is no typechecker, no CI workflow, no pre-commit config. Verification is
   of raising into the listen loop.
 - `CommandProcessor.transcribe(..., command=True)` is the *only* slot that gets
   STT `hotwords` (`stt_hotwords()`: app words + resolver aliases + remembered
-  aliases). Wake segments and confirmation replies must not get them — a "yes"
+  aliases + the multi-word Start Menu names — "microsoft edge", "file
+  explorer" — from a once-per-session `multi_word_shortcut_names()` scan;
+  single-word stems stay out of that budget). Wake segments and confirmation
+  replies must not get them — a "yes"
   decoded as an app name cancels a confirmation. `hotwords` is faster-whisper's
   own parameter (prompt-token biasing, auto-truncated to half the text context).
 - TTS caching has two tiers, and the difference matters for the `tts` latency

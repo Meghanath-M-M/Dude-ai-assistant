@@ -32,6 +32,7 @@ from nova_agent.core.query_extractor import (
     parse_set_browser,
     parse_set_preference,
     parse_set_project,
+    split_compound,
 )
 from nova_agent.core.runtime_monitor import RuntimeMonitor
 from nova_agent.core.safety import (
@@ -47,6 +48,7 @@ from nova_agent.core.wake_word import WakeWordEngine
 from nova_agent.tools.app_controller import (
     APP_PATHS,
     RESOLVE_ALIASES,
+    multi_word_shortcut_names,
     open_app,
     open_path,
     resolve_app,
@@ -185,6 +187,14 @@ class CommandProcessor:
         # Set when a launch verb named no app ("open."): the next capture is
         # read as the missing target instead of as a fresh command.
         self.pending_clarification: str | None = None
+        # Follow-up clauses of a compound command ("...and open microsoft
+        # edge"), queued by observe() and run by run_observation() after the
+        # head clause — or after the head's spoken confirmation, if the head
+        # needs one. Dropped together with a rejected/pending turn.
+        self.pending_compound: list[dict] = []
+        # Long Start Menu names for decode biasing: scanned once per session
+        # (the aliases below must take effect immediately, these need not).
+        self._shortcut_names: set[str] | None = None
         self.last_intent: dict | None = None
         self.last_text: str = ""
         self.timings: dict[str, float] = {}
@@ -220,9 +230,15 @@ class CommandProcessor:
         the set of names *this* install understands: the built-in app words,
         the resolver aliases, and whatever the user taught with "set browser
         to ...". Cheap enough to rebuild per command (one small SELECT), which
-        is what lets "set browser to edge" take effect immediately.
+        is what lets "set browser to edge" take effect immediately. Long names
+        ("microsoft edge", "file explorer") are the ones Whisper mangles, so
+        they join from a once-per-session Start Menu scan — too much work to
+        repeat for every command.
         """
         names = set(APP_WORDS) | set(RESOLVE_ALIASES)
+        if self._shortcut_names is None:
+            self._shortcut_names = multi_word_shortcut_names()
+        names |= self._shortcut_names
         if self.context is not None:
             for alias, app_key in self.context.list_aliases():
                 names.update({alias, app_key})
@@ -230,11 +246,36 @@ class CommandProcessor:
         return ", ".join(sorted(names)) or None
 
     def observe(self, text: str) -> dict:
-        """Decide what was asked, without doing anything about it."""
+        """Decide what was asked, without doing anything about it.
+
+        A compound utterance ("increase brightness and open microsoft edge")
+        is matched clause by clause and kept as a compound only when *two*
+        clauses claim an intent; one match falls back to routing the whole
+        phrase, so a conjunction attached to a real command stays one
+        command. The follow-up clauses wait in ``pending_compound`` for
+        ``run_observation``.
+        """
+        # A fresh observation replaces any queue left from an older command.
+        self.pending_compound = []
+        text = (text or "").strip()
         started = time.perf_counter()
-        intent, score = self.router.match(text)
+        matched: list[dict] = []
+        clauses = split_compound(text)
+        if len(clauses) > 1:
+            for clause in clauses:
+                intent, score = self.router.match(clause)
+                if intent is not None:
+                    matched.append({"text": clause, "intent": intent, "score": score})
+        if len(matched) >= 2:
+            head, *follow_ups = matched
+            self.pending_compound = follow_ups
+        else:
+            # One matching clause is not a compound: route the whole phrase
+            # exactly as before (any partial match above is discarded).
+            intent, score = self.router.match(text)
+            head = {"text": text, "intent": intent, "score": score}
         self.timings["intent"] = time.perf_counter() - started
-        return {"text": (text or "").strip(), "intent": intent, "score": score}
+        return head
 
     def respond(self, message: str) -> str:
         """Speak a message without executing anything (used for cancellations)."""
@@ -248,6 +289,28 @@ class CommandProcessor:
         return self.run_observation(observation, confirmed=confirmed)
 
     def run_observation(self, observation: dict, confirmed: bool = False) -> str:
+        """Run one observed command, then any queued compound follow-ups.
+
+        Clauses run in turn; the moment one needs a spoken confirmation the
+        rest wait in ``pending_compound`` — the confirm turn picks the queue
+        back up (the confirmed clause runs first), while a rejection or a
+        fresh command drops it along with the pending action. Action time is
+        summed across clauses so ``--stats`` still sees the whole utterance
+        against the budget. Exactly one ``_respond`` per call, so a compound
+        is spoken as a single joined reply.
+        """
+        total_action = 0.0
+        response = self._run_one(observation, confirmed)
+        total_action += self.timings.pop("action", 0.0)
+        while self.pending_compound and self.pending_confirmation is None:
+            follow_up = self.pending_compound.pop(0)
+            response = join_replies(response, self._run_one(follow_up))
+            total_action += self.timings.pop("action", 0.0)
+        if total_action:
+            self.timings["action"] = total_action
+        return self._respond(response)
+
+    def _run_one(self, observation: dict, confirmed: bool = False) -> str:
         text = observation.get("text", "")
         intent = observation.get("intent")
         score = observation.get("score", 0.0)
@@ -261,7 +324,7 @@ class CommandProcessor:
         # warnings either — indistinguishable from a broken loop.
         if not text:
             print("Heard: (nothing intelligible)")
-            return self._respond(MISS_RESPONSE)
+            return MISS_RESPONSE
 
         if intent is None and self.pending_clarification == "open_app":
             # Answer to "Open what?" — the *name* of the app was the question,
@@ -288,7 +351,7 @@ class CommandProcessor:
                 f"Intent: none (best score {score:.2f}{runner_up}, "
                 "below the confidence band)"
             )
-            return self._respond(MISS_RESPONSE)
+            return MISS_RESPONSE
 
         action = intent["action"]
         print(f"Heard: {text}")
@@ -299,13 +362,11 @@ class CommandProcessor:
         if requires_confirmation(intent) and not confirmed:
             self.pending_confirmation = intent
             self.pending_text = text
-            return self._respond(confirmation_prompt(intent))
+            return confirmation_prompt(intent)
 
         if self.capabilities is not None and not self.capabilities.is_enabled(action):
             self.pending_confirmation = None
-            return self._respond(
-                f"The {action.replace('_', ' ')} action is not enabled yet"
-            )
+            return f"The {action.replace('_', ' ')} action is not enabled yet"
 
         started = time.perf_counter()
         response = self.execute(action, intent, dispatch_text)
@@ -316,7 +377,7 @@ class CommandProcessor:
         self.last_text = dispatch_text
         if self.context is not None:
             self.context.log_command(action, dispatch_text)
-        return self._respond(response)
+        return response
 
     def execute(self, action: str, intent: dict, text: str) -> str:
         """Run one dispatched action and return the phrase to speak."""
@@ -1089,6 +1150,8 @@ class NovaAgent:
             # The swap asked for its own confirmation: loop and ask again.
 
         self.processor.pending_confirmation = None
+        # A rejected/pending turn also drops a compound's queued follow-ups.
+        self.processor.pending_compound = []
         return self.processor.respond(CANCELLED_RESPONSE)
 
     def _debug_stages(self) -> None:
@@ -1482,6 +1545,23 @@ def calibrate_wizard(wake_word: str | None = None) -> int:
     calibrate_microphone()
     print(f"\nStep 2/2: wake phrase attempts (does {wake_word!r} wake it?)")
     return wake_probe(wake_word=wake_word, attempts=5)
+
+
+def join_replies(*parts: str) -> str:
+    """Join the per-clause replies of a compound command into one response.
+
+    Each clause answers with its own sentence ("Turned the brightness up",
+    "Would open chrome (C:\\...)"); the stop between clauses is normalized so
+    a reply that ended without one doesn't run into the next clause, while
+    the final clause keeps whatever punctuation it already had.
+    """
+    live = [part.strip() for part in parts if part and part.strip()]
+    if not live:
+        return ""
+    body = ". ".join(part.rstrip(". ") for part in live[:-1])
+    if not body:
+        return live[-1]
+    return f"{body}. {live[-1]}"
 
 
 def speakable(response: str) -> str:

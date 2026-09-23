@@ -26,6 +26,26 @@ def _start_menu_roots() -> list[Path]:
     return roots
 
 
+def multi_word_shortcut_names() -> set[str]:
+    """Every multi-word Start Menu name, lowercase — the *long* names.
+
+    Field feedback ("you need to add a long name"): Whisper's priors carry
+    single words like "edge" fine, but long names ("microsoft edge", "file
+    explorer") decode poorly without a hint, so the command slot biases the
+    decoder with these. Lowercased because that is how they will be spoken;
+    single-word stems stay out on purpose — they dilute the prompt budget
+    faster-whisper caps at half the text context.
+    """
+    names: set[str] = set()
+    for root in _start_menu_roots():
+        if not root.is_dir():
+            continue
+        for link in root.rglob("*.lnk"):
+            if " " in link.stem:
+                names.add(link.stem.lower())
+    return names
+
+
 # Common spoken names that match neither the executable nor any shortcut
 # ("open calculator" -> calc.exe; Win11 ships no Calculator.lnk).
 RESOLVE_ALIASES = {"calculator": "calc"}
