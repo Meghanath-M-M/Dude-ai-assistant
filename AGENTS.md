@@ -81,7 +81,15 @@ There is no typechecker, no CI workflow, no pre-commit config. Verification is
   capture is then dispatched as `open <answer>` instead of being read as a new
   command. `RETRY_RESPONSES` (miss **and** the question) keeps that turn open in
   `NovaAgent._finish_turn`. Defaulting to chrome there was the field bug where
-  `Heard: open.` opened the browser.
+  `Heard: open.` opened the browser. `PRONOUN_TARGETS` ("it", "that", …) are
+  treated the same as "no target named", so "open it" gets the clarification
+  too instead of "I don't know how to open it yet." Launching: `.lnk`
+  shortcuts and folders go through `os.startfile` (ShellExecute —
+  CreateProcess refuses them with WinError 193 "%1 is not a valid Win32
+  application", the live `open microsoft edge` crash; the shell also keeps a
+  shortcut's own arguments), executables keep `Popen` with the shell as an
+  OSError fallback, and a double failure answers "I couldn't open X." instead
+  of raising into the listen loop.
 - `CommandProcessor.transcribe(..., command=True)` is the *only* slot that gets
   STT `hotwords` (`stt_hotwords()`: app words + resolver aliases + remembered
   aliases). Wake segments and confirmation replies must not get them — a "yes"
@@ -98,6 +106,11 @@ There is no typechecker, no CI workflow, no pre-commit config. Verification is
   entries already on disk (no re-synthesis on later boots). The screen-reading
   string is single-sourced in `tools/screen_reader.py`
   (`TESSERACT_MISSING_MESSAGE`) because the cached key must match exactly.
+- The TTS cache is keyed by **phrase only**, so a voice change drops and
+  rebuilds it: `_set_preference` → `_recache_replies()` clears
+  (`TTSEngine.clear_cache()`) and re-preloads on a daemon thread — otherwise
+  every cached reply, including the preloaded phrasebook, keeps playing in the
+  old voice after "set voice to am_michael".
   `_respond` prints the full response but speaks `speakable(response)` —
   filesystem paths are console detail, never read aloud. `--stats` skips
   commands that **start** while `NovaAgent.warm_done` is clear (background
@@ -117,6 +130,39 @@ There is no typechecker, no CI workflow, no pre-commit config. Verification is
   claims `time_check` *after* the example loop (so "it's time to open chrome"
   still opens Chrome). `IntentRouter.match` also records `last_best_label`, which
   the miss line prints so a near miss names the intent it nearly matched.
+- Volume control is Core Audio first (`pycaw`, `tools/system.py`):
+  `parse_volume_command` matches **unmute before mute** ("unmute" contains
+  "mute") and understands spoken levels ("fifty percent"); `apply_volume`
+  reads the level *back* from the endpoint ("Volume set to 30 percent.").
+  `_endpoint()` calls `comtypes.CoInitialize()` because commands run on the
+  worker thread (pycaw fails there with "CoInitialize has not been called" —
+  found live; `--check` works only because it runs on the main thread).
+  Without pycaw the media-key fallback can only nudge and toggle — it says
+  "Toggled mute" and refuses exact levels rather than lying. `--check` prints
+  `Volume backend: core audio | media keys`. Tests use the fake endpoint in
+  `tests/test_volume.py` — never move the machine's real volume; dry-run
+  returns "Would ..." *before* touching the endpoint.
+- Brightness shares `tools/system.py` and the `system_control` action:
+  `intents.json`'s `system_brightness` (target `brightness`) routes through
+  `CommandProcessor._control_system`, which picks the device from
+  `intent.get("target")`. Levels go through the `wmi` package to `root\WMI`,
+  and `WmiSetBrightness` is called **by keyword** (`Brightness=`, `Timeout=1`)
+  because this machine's MOF declares `(Brightness, Timeout)` — the *reverse*
+  of the `(Timeout, Brightness)` order community recipes pass positionally,
+  and the wrong guess blanks the screen to 1%.
+  `pythoncom.CoInitialize()`/`CoUninitialize()` bracket the live call (the
+  worker-thread lesson pycaw taught, on a second bus). The parsers guard each
+  other: `parse_volume_command` bails on "bright"/"dim" tokens (the field
+  phrase "increase the brightness" parsed as volume-up — "increase" alone was
+  enough) and `parse_brightness_command` requires one. Routing gives a
+  brightness *word* the same outright 0.75 claim `VOLUME_WORDS` has
+  (`IntentRouter.BRIGHTNESS_WORDS`): the field phrases "turn brightness down
+  to 50"/"decrease the brightness to 50" scored 0.77/0.78 — the right intent,
+  but under the 0.82 embedding band with no verbatim example to claim. Live
+  level replies settle-poll ≤1 s for the applied value; a machine with no controllable
+  display answers "I can't change the brightness on this display." `--check`
+  prints `Brightness backend: wmi | unsupported`. Tests use the fake monitor
+  in `tests/test_brightness.py` — never move the machine's real brightness.
 - The HUD is the one component that owns a Qt thread. `NovaHUD.stop()` only
   *requests* a stop (`_stop_requested`, polled by a QTimer on the Qt thread);
   calling `app.quit()` from the caller's thread produced
@@ -131,7 +177,7 @@ There is no typechecker, no CI workflow, no pre-commit config. Verification is
 
 - Tests inject fakes: `CommandProcessor(FakeSTT, FakeRouter, FakeTTS)` — follow that
   pattern; no test needs a microphone or GPU.
-- Tests hard-code counts/names: `len(router.intents) == 17`, risky intents ==
+- Tests hard-code counts/names: `len(router.intents) == 18`, risky intents ==
   `{close_window, tidy_downloads, lock_workstation}` (both in `tests/test_phase0.py`).
   Adding or renaming an intent in `intents.json` requires updating those tests and
   `IMPLEMENTED_ACTIONS`.

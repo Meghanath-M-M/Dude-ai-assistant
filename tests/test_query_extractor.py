@@ -2,6 +2,7 @@ from nova_agent.core.query_extractor import (
     extract_app_phrase,
     extract_project_name,
     extract_search_query,
+    is_pronoun_target,
 )
 
 
@@ -51,3 +52,19 @@ def test_extract_app_phrase_is_none_without_a_launch_shape():
     assert extract_app_phrase("just talking about apps") is None
     assert extract_app_phrase("") is None
     assert extract_app_phrase("open") is None  # trigger with nothing after it
+
+
+def test_extract_app_phrase_keeps_a_pronoun_for_the_pronoun_check():
+    # The phrase must survive extraction so _open_app can recognise that it
+    # points at something instead of naming it.
+    assert extract_app_phrase("open it") == "it"
+    assert extract_app_phrase("launch that") == "that"
+
+
+def test_is_pronoun_target_flags_pointers_only():
+    assert is_pronoun_target("it")
+    assert is_pronoun_target(" That ")  # normalized like every other phrase
+    assert is_pronoun_target("something")
+    assert not is_pronoun_target("notepad")
+    assert not is_pronoun_target("")
+    assert not is_pronoun_target(None)

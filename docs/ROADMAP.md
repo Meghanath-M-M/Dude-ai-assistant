@@ -363,7 +363,7 @@ thread` plus `QObject::killTimer: Timers cannot be stopped from another thread`.
   at 0.75, placed *after* the example loop so "it's time to open chrome" is
   still an open command.
 - **Identity and help intents** — "what's your name"/"who are you" and
-  "help"/"what can you do" (17 intents now; `length == 17` asserted in
+  "help"/"what can you do" (18 intents now; `length == 18` asserted in
   `tests/test_phase0.py`). The help reply is generated from the capability
   registry, so a disabled destructive action is never advertised.
 - **Misses name the runner-up** — `IntentRouter.match` stores
@@ -398,5 +398,60 @@ thread` plus `QObject::killTimer: Timers cannot be stopped from another thread`.
   entries already on disk, and `TESSERACT_MISSING_MESSAGE` is now single-sourced
   so the cached key cannot drift from the spoken text.
 
-Verification: `python -m pytest` 189 passed (was 171; +18 in
-`tests/test_command_understanding.py`), `python -m ruff check .` clean.
+- **Round-5 follow-up: volume, pronouns, the voice cache** —
+  **Volume** left media-key nudging for Core Audio (`pycaw`):
+  `tools/system.py` parses the full command shape (unmute matched before
+  mute, spoken levels like "fifty percent", directions) and applies it with a
+  read-back ("Volume set to 30 percent."), real mute/unmute state, and a 10%
+  step for up/down — the media keys remain an honest fallback ("Toggled mute";
+  exact levels refused without pycaw) and `--check` reports the live backend.
+  **Pronouns**: "open it"/"open that" asks "Open what?" through
+  `is_pronoun_target` instead of answering "I don't know how to open it
+  yet.", joining the same clarification turn a bare launch verb gets.
+  **Voice cache**: the TTS cache is keyed by phrase, not voice, so
+  "set voice to …" now purges it and re-preloads the phrasebook on a
+  background thread (`_recache_replies`) — otherwise every canned reply would
+  keep playing in the old voice forever.
+
+- **Round-5 follow-up, part 2: brightness** — the field log
+  `Heard: increase the brightness` scored 0.42 for system_volume — correctly
+  refused, but the parser underneath was a trap: `parse_volume_command`
+  returned volume-up ("increase" alone was enough). There is now a
+  `system_brightness` intent (target `brightness`, 18 intents total) sharing
+  the `system_control` action; `_control_system` picks the device from the
+  intent target. `apply_brightness` drives the display's `root\WMI`
+  interface through `wmi`/`pywin32` (~50 ms — a PowerShell subprocess would
+  have burned the whole 500 ms action budget), calls `WmiSetBrightness`
+  **by keyword** after the live MOF proved this machine declares
+  `(Brightness, Timeout)` — the reverse of what community recipes pass
+  positionally — brackets COM with `pythoncom.CoInitialize()`/
+  `CoUninitialize()` (the worker-thread lesson pycaw taught), and reads the
+  applied level back through a ≤1 s settle poll. Both parsers now refuse
+  each other's phrases, a display without WMI control answers "I can't
+  change the brightness on this display.", `--check` gained a
+  `Brightness backend:` line, and `tests/test_brightness.py` runs everything
+  against a fake monitor. The first mic run of these phrases then found the
+  embedding band's dead zone: "turn brightness down to 50" and "decrease the
+  brightness to 50" scored 0.77/0.78 for system_brightness — clearly the
+  right intent, but under the 0.82 threshold with no verbatim example inside
+  the phrase — so `IntentRouter` gained `BRIGHTNESS_WORDS`, the same outright
+  0.75 claim `VOLUME_WORDS` already had. Parse-side needed no change: an
+  explicit level beats the direction, so "down to 50" sets 50 (the volume
+  contract too).
+- **Round-6 (field): shortcuts actually launch** — `open microsoft edge` and
+  `open file explorer` routed correctly (`open_app` 0.75) and then died with
+  `WinError 193 "%1 is not a valid Win32 application"`: the resolver returns
+  Start Menu `.lnk` files for both — and for `chrome` on this machine, which
+  has no `chrome.exe` in Program Files — but `open_path` handed them to
+  `subprocess.Popen`, and CreateProcess cannot execute shortcuts. Shortcuts
+  and folders now launch through `os.startfile` (ShellExecute, which also
+  keeps a shortcut's own arguments), executables keep Popen with the shell as
+  an OSError fallback, and a double failure answers "I couldn't open X."
+  instead of raising into the listen loop. Dry-run had hidden this: every
+  earlier field round stopped at "Would open chrome".
+
+Verification: `python -m pytest` 237 passed (+16 in
+`tests/test_brightness.py`, +5 launch tests in `tests/test_app_resolution.py`;
+the round-5 follow-up before it added `tests/test_volume.py` and the
+pronoun/recache coverage), the intent count/membership asserted at 18 in
+`tests/test_phase0.py`, `python -m ruff check .` clean.

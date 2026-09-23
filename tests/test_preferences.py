@@ -127,6 +127,41 @@ def test_tts_voice_preference_is_applied_and_persisted(tmp_path):
     assert "af_heart" in response
 
 
+def test_changing_the_voice_recaches_the_fixed_replies(tmp_path):
+    """The cache is keyed by phrase, not voice — without a recache the old
+    voice would keep saying every canned reply, phrasebook included."""
+    import threading
+
+    from nova_agent.main import speakable
+
+    class CacheTTS(FakeTTS):
+        def __init__(self):
+            super().__init__()
+            self.cleared = 0
+            self.preloaded: list[str] = []
+            self.done = threading.Event()
+
+        def clear_cache(self):
+            self.cleared += 1
+            return 0
+
+        def preload(self, phrases):
+            self.preloaded = list(phrases)
+            self.done.set()
+            return len(phrases)
+
+    processor, _context = _processor(tmp_path)
+    tts = CacheTTS()
+    processor.tts = tts
+
+    response = processor._set_preference("set voice to af heart")
+
+    assert response == "Voice set to af_heart."
+    assert tts.cleared == 1  # the previous voice's clips are gone...
+    assert tts.done.wait(timeout=5.0)  # ...and the phrasebook returns, re-recorded
+    assert tts.preloaded == [speakable(reply) for reply in processor.canned_replies()]
+
+
 def test_unknown_voice_is_refused(tmp_path):
     processor, context = _processor(tmp_path)
 

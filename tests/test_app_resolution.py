@@ -179,3 +179,90 @@ def test_set_browser_still_refuses_an_app_nothing_can_resolve(tmp_path, monkeypa
     response = processor.process("command.wav")
 
     assert response == "I don't know how to open zzz no such browser yet."
+
+
+# --- launching: CreateProcess cannot execute a shortcut ----------------------
+
+
+def _explode_popen(_args):
+    raise AssertionError("Popen must not be called for a shortcut")
+
+
+def test_shortcut_launch_goes_through_the_shell(tmp_path, monkeypatch):
+    """Live field log: 'open microsoft edge' resolved Microsoft Edge.lnk and
+    died in CreateProcess with WinError 193 "%1 is not a valid Win32
+    application". Shortcuts must launch via the shell (os.startfile)."""
+    shortcut = tmp_path / "Microsoft Edge.lnk"
+    shortcut.write_bytes(b"")
+    launched = []
+    monkeypatch.setattr(app_controller.os, "startfile", launched.append)
+    monkeypatch.setattr(app_controller.subprocess, "Popen", _explode_popen)
+
+    response = app_controller.open_path("microsoft edge", shortcut, dry_run=False)
+
+    assert response == "Opening microsoft edge"
+    assert launched == [shortcut]
+
+
+def test_directory_launch_goes_through_the_shell(tmp_path, monkeypatch):
+    folder = tmp_path / "SomeProject"
+    folder.mkdir()
+    launched = []
+    monkeypatch.setattr(app_controller.os, "startfile", launched.append)
+    monkeypatch.setattr(app_controller.subprocess, "Popen", _explode_popen)
+
+    app_controller.open_path("SomeProject", folder, dry_run=False)
+
+    assert launched == [folder]
+
+
+def test_executable_launch_keeps_createprocess(tmp_path, monkeypatch):
+    """The field-proven path for notepad & friends must not change shape."""
+    exe = tmp_path / "tool.exe"
+    exe.write_bytes(b"")
+    launched = []
+    monkeypatch.setattr(app_controller.subprocess, "Popen", launched.append)
+
+    def refuse_shell(_path):
+        raise AssertionError("os.startfile must not be needed for a plain exe")
+
+    monkeypatch.setattr(app_controller.os, "startfile", refuse_shell)
+
+    assert app_controller.open_path("tool", exe, dry_run=False) == "Opening tool"
+    assert launched == [[str(exe)]]
+
+
+def test_createprocess_refusal_falls_back_to_the_shell(tmp_path, monkeypatch):
+    """An unusual file (WinError 193 from CreateProcess) still launches."""
+    odd = tmp_path / "thing.url"
+    odd.write_bytes(b"")
+    launched = []
+
+    def refuse_popen(_args):
+        raise OSError(193, "%1 is not a valid Win32 application")
+
+    monkeypatch.setattr(app_controller.subprocess, "Popen", refuse_popen)
+    monkeypatch.setattr(app_controller.os, "startfile", launched.append)
+
+    assert app_controller.open_path("thing", odd, dry_run=False) == "Opening thing"
+    assert launched == [odd]
+
+
+def test_total_launch_failure_answers_honestly(monkeypatch, tmp_path):
+    """No traceback into the listen loop: the spoken reply admits failure."""
+    exe = tmp_path / "tool.exe"
+    exe.write_bytes(b"")
+    monkeypatch.setattr(
+        app_controller.subprocess,
+        "Popen",
+        lambda _args: (_ for _ in ()).throw(OSError(193, "nope")),
+    )
+    monkeypatch.setattr(
+        app_controller.os,
+        "startfile",
+        lambda _path: (_ for _ in ()).throw(OSError(2, "nope")),
+    )
+
+    assert (
+        app_controller.open_path("tool", exe, dry_run=False) == "I couldn't open tool."
+    )

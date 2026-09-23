@@ -22,6 +22,12 @@
     "safe": true,
     "examples": ["mute the volume", "turn up the sound", "lower my volume", "set volume to fifty percent"]
   },
+  "system_brightness": {
+    "action": "system_control",
+    "target": "brightness",
+    "safe": true,
+    "examples": ["increase the brightness", "brightness up", "dim the screen", "lower the brightness", "set brightness to fifty percent"]
+  },
   "read_screen": {
     "action": "screen_ocr",
     "safe": true,

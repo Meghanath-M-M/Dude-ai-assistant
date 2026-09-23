@@ -27,6 +27,7 @@ from nova_agent.core.query_extractor import (
     extract_app_phrase,
     extract_project_name,
     extract_search_query,
+    is_pronoun_target,
     looks_like_open_command,
     parse_set_browser,
     parse_set_preference,
@@ -112,7 +113,7 @@ ACTION_LABELS = {
     "browser_search": "search the web",
     "screen_ocr": "read the screen",
     "context_open": "open saved projects",
-    "system_control": "control the volume",
+    "system_control": "control the volume and brightness",
     "greet": "say hello",
     "time_check": "tell the time",
     "repeat_last": "repeat the last command",
@@ -335,9 +336,10 @@ class CommandProcessor:
             return self._open_project(text)
 
         # intents.json declares this task as "system_control"; accept the task
-        # name too so a rename cannot silently disable volume control.
-        if action in {"system_control", "system_volume"}:
-            return self._control_volume(text)
+        # names too so a rename cannot silently disable them. The intent's
+        # target then picks the device: volume or brightness.
+        if action in {"system_control", "system_volume", "system_brightness"}:
+            return self._control_system(text, intent)
 
         if action == "greet":
             # "bye" is a greeting-shaped command; answering it with "How can I
@@ -436,17 +438,35 @@ class CommandProcessor:
             startfile(path)
         return f"Opening project {label}"
 
-    def _control_volume(self, text: str) -> str:
-        from nova_agent.tools.system import adjust_volume, detect_volume_action
+    def _control_system(self, text: str, intent: dict | None = None) -> str:
+        """Volume or brightness, picked by the intent's target (volume by default)."""
+        from nova_agent.tools.system import (
+            apply_brightness,
+            apply_volume,
+            parse_brightness_command,
+            parse_volume_command,
+        )
 
-        action = detect_volume_action(text)
-        if action is None:
+        if (intent or {}).get("target") == "brightness":
+            command = parse_brightness_command(text)
+            if command is None:
+                return "Do you want the brightness up, down, or to a percent?"
+            return apply_brightness(command, dry_run=self.dry_run)
+        command = parse_volume_command(text)
+        if command is None:
             return "Do you want the volume up, down, or muted?"
-        return adjust_volume(action, dry_run=self.dry_run)
+        return apply_volume(command, dry_run=self.dry_run)
 
     def _open_app(self, intent: dict, text: str) -> str:
         """Open the app that was named, or say honestly that we cannot."""
         phrase = extract_app_phrase(text)
+        if phrase is not None and is_pronoun_target(phrase):
+            # "open it" / "open that": a pronoun names nothing, exactly like a
+            # bare launch verb, so ask which app instead of answering "I don't
+            # know how to open it yet." The answer then fills in the target.
+            phrase = None
+            self.pending_clarification = "open_app"
+            return OPEN_WHAT_RESPONSE
         if phrase is None:
             if looks_like_open_command(text):
                 return "I don't know how to open that yet."
@@ -524,6 +544,7 @@ class CommandProcessor:
                 return "I don't know that voice. Say a name like: af heart."
             self.tts.voice = value
             self.context.set_preference(key, value)
+            self._recache_replies()
             return f"Voice set to {value}."
 
         enabled = value == "1"
@@ -532,6 +553,25 @@ class CommandProcessor:
         if enabled:
             return "Dry run is on; I'll only report what I would do."
         return "Dry run is off; I will act for real."
+
+    def _recache_replies(self) -> None:
+        """Re-record the fixed replies in the new voice, off the command path.
+
+        The TTS cache is keyed by phrase, not by voice, so without this every
+        cached clip — including the preloaded phrasebook — would keep playing in
+        the previous voice after "set voice to ...". Rebuilding inline would
+        stall the very reply that reports the change, so it runs on a daemon
+        thread; the synthesis lock serialises it with any other reply.
+        """
+        clear = getattr(self.tts, "clear_cache", None)
+        preload = getattr(self.tts, "preload", None)
+        if clear is None or preload is None:
+            return  # a test double, or an engine without the cache API
+        clear()
+        phrases = [speakable(reply) for reply in self.canned_replies()]
+        threading.Thread(
+            target=lambda: preload(phrases), name="tts-recache", daemon=True
+        ).start()
 
     def _repeat_last(self) -> str:
         """Re-run the previous command, re-asking for confirmation if needed."""
@@ -596,6 +636,15 @@ class CommandProcessor:
             "Screen reading needs Tesseract OCR to be installed.",
             "What should I search for?",
             "Do you want the volume up, down, or muted?",
+            "Do you want the brightness up, down, or to a percent?",
+            "Turned the volume up",
+            "Turned the volume down",
+            "Turned the brightness up",
+            "Turned the brightness down",
+            "Muted the volume.",
+            "Unmuted the volume.",
+            "Toggled mute",  # the media-key fallback, which can only toggle
+            "I can't change the brightness on this display.",
             "I don't know how to open that yet.",
             "I don't know where that is. Say set project ml to a folder path.",
             "I haven't run anything yet.",
@@ -1362,6 +1411,14 @@ def check_environment() -> int:
     print(f"Voice detector: {recorder.backend}")
     if recorder.vad is not None and recorder.vad.load_error:
         print(f"Voice detector note: {recorder.vad.load_error}")
+
+    from nova_agent.tools.system import brightness_backend, volume_backend
+
+    # Which path volume commands take: levels and mute states need Core Audio,
+    # the media keys can only nudge and toggle. Brightness needs a controllable
+    # display behind WMI; desktops driving external monitors only report here.
+    print(f"Volume backend: {volume_backend()}")
+    print(f"Brightness backend: {brightness_backend()}")
 
     enabled = registry.list_enabled()
     print(f"Actions enabled: {len(enabled)}")

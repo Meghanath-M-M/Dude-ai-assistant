@@ -11,6 +11,19 @@ class IntentRouter:
         "project", "projects", "workspace", "folder", "repo", "repository"
     }
     VOLUME_WORDS: ClassVar[set[str]] = {"volume", "sound", "mute", "unmute", "louder", "quieter"}
+    # A brightness word means brightness even when the phrasing carries no
+    # verbatim example: field transcripts "turn brightness down to 50" and
+    # "decrease the brightness to 50" scored 0.77/0.78 for system_brightness —
+    # the right intent, but under the 0.82 embedding band with nothing for the
+    # example loop to claim. Claimed outright at 0.75, exactly like volume.
+    BRIGHTNESS_WORDS: ClassVar[set[str]] = {
+        "brightness",
+        "brighter",
+        "dim",
+        "dimmer",
+        "darker",
+        "luminance",
+    }
 
     # Verbs that introduce an app ("open notepad"). Spoken on their own they
     # name no target at all, which is the dispatcher's cue to ask "Open what?"
@@ -157,6 +170,9 @@ class IntentRouter:
 
         if any(word in tokens for word in self.VOLUME_WORDS):
             return self.intents["system_volume"], 0.75
+
+        if any(word in tokens for word in self.BRIGHTNESS_WORDS):
+            return self.intents["system_brightness"], 0.75
 
         # Match whole words only: raw substring containment let short text
         # ("i") claim an example by matching a letter inside a longer word.

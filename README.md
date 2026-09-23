@@ -15,7 +15,8 @@ python -m nova_agent --check
 ```
 
 `--check` reports the interpreter, the loaded intents, the STT device, the
-execution mode, and which optional packages are installed.
+execution mode, the volume and brightness backends (Core Audio vs media
+keys; WMI vs unsupported), and which optional packages are installed.
 
 ## Running
 
@@ -108,7 +109,8 @@ results through the real pipeline.
 | "open chrome", "launch the browser" | Starts Chrome |
 | "open vscode", "launch my code editor" | Starts VS Code |
 | "search the web for rust ownership" | Opens the search with the extracted query |
-| "mute the volume", "turn up the sound" | Multimedia volume keys |
+| "mute the volume", "turn up the sound", "set volume to thirty percent" | Real mute/level via Core Audio (`pycaw`); media keys as fallback |
+| "increase the brightness", "dim the screen", "set brightness to fifty percent" | Real brightness via the display's WMI interface (`wmi`); honest refusal on displays without it |
 | "read the screen", "what does this say" | OCR of the current screen |
 | "open my ml project" | Opens a folder remembered in SQLite |
 | "open notepad", "open excel", "open notepadd" | Any installed app (PATH, then Start Menu shortcuts, then a close-name match) |

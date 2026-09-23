@@ -161,6 +161,33 @@ def test_a_launch_verb_with_no_app_asks_instead_of_opening_chrome():
     assert processor.tts.messages == [OPEN_WHAT_RESPONSE]
 
 
+def test_a_pronoun_target_asks_which_app():
+    """\"open it\" names nothing either: ask, don't refuse the pronoun."""
+    router = ScriptedRouter({"open it.": ({"action": "open_app", "safe": True}, 0.75)})
+    processor = CommandProcessor(FakeSTT("open it."), router, FakeTTS())
+
+    response = processor.process("command.wav")
+
+    assert response == OPEN_WHAT_RESPONSE
+    assert processor.pending_clarification == "open_app"
+
+
+def test_after_open_what_a_pronoun_answer_still_becomes_the_target(tmp_path, monkeypatch):
+    """The full exchange: "open it." -> "Open what?" -> "notepad" opens it."""
+    (shortcut,) = _isolated_apps(tmp_path, monkeypatch, "Notepad.lnk")
+    stt = FakeSTT("open it.")
+    router = ScriptedRouter({"open it.": ({"action": "open_app", "safe": True}, 0.75)})
+    processor = CommandProcessor(stt, router, FakeTTS())
+
+    assert processor.process("command.wav") == OPEN_WHAT_RESPONSE
+
+    stt.text = "notepad"
+    response = processor.process("command.wav")
+
+    assert response == f"Would open notepad ({shortcut})"
+    assert processor.pending_clarification is None
+
+
 def test_the_answer_to_open_what_is_read_as_the_missing_target(tmp_path, monkeypatch):
     (shortcut,) = _isolated_apps(tmp_path, monkeypatch, "Gallery.lnk")
     stt = FakeSTT("open.")
@@ -174,6 +201,33 @@ def test_the_answer_to_open_what_is_read_as_the_missing_target(tmp_path, monkeyp
     response = processor.process("command.wav")
 
     assert response == f"Would open gallery ({shortcut})"
+    assert processor.pending_clarification is None
+
+
+def test_a_pronoun_target_asks_instead_of_refusing():
+    """"open it" points at something without naming it — the honest reply is
+    the same "Open what?" a bare launch verb gets, not "I don't know how to
+    open it yet." """
+    router = ScriptedRouter({"open it": ({"action": "open_app", "safe": True}, 0.9)})
+    processor = CommandProcessor(FakeSTT("open it"), router, FakeTTS())
+
+    response = processor.process("command.wav")
+
+    assert response == OPEN_WHAT_RESPONSE
+    assert processor.pending_clarification == "open_app"
+    assert processor.tts.messages == [OPEN_WHAT_RESPONSE]
+
+
+def test_the_answer_to_open_what_fills_a_pronoun_target(tmp_path, monkeypatch):
+    (shortcut,) = _isolated_apps(tmp_path, monkeypatch, "Gallery.lnk")
+    stt = FakeSTT("open it")
+    router = ScriptedRouter({"open it": ({"action": "open_app", "safe": True}, 0.9)})
+    processor = CommandProcessor(stt, router, FakeTTS())
+
+    assert processor.process("command.wav") == OPEN_WHAT_RESPONSE
+
+    stt.text = "gallery"  # the answer names the app the pronoun pointed at
+    assert processor.process("command.wav") == f"Would open gallery ({shortcut})"
     assert processor.pending_clarification is None
 
 
@@ -393,6 +447,10 @@ def test_the_phrasebook_holds_the_fixed_replies(tmp_path):
     assert IDENTITY_RESPONSE in replies
     assert CANCELLED_RESPONSE in replies
     assert any(reply.startswith("I can ") for reply in replies)  # the help list
+    assert "Muted the volume." in replies
+    assert "Unmuted the volume." in replies
+    assert "Turned the volume up" in replies
+    assert "Toggled mute" in replies  # the media-key fallback's honest wording
     assert all(reply.strip() for reply in replies)
 
 
@@ -416,3 +474,44 @@ def test_the_screen_reading_failure_is_preloaded_verbatim(monkeypatch):
 
     assert response == f"Screen reading is unavailable. {TESSERACT_MISSING_MESSAGE}"
     assert response in processor.canned_replies()
+
+
+def test_changing_the_voice_drops_and_rebuilds_the_tts_cache(tmp_path, monkeypatch):
+    """A voice change must not keep playing clips in the previous voice."""
+    import nova_agent.main as main_module
+
+    class RecordingTTS(FakeTTS):
+        def __init__(self):
+            super().__init__()
+            self.voice = "af_heart"
+            self.cleared = 0
+            self.preloaded: list[list[str]] = []
+
+        def clear_cache(self):
+            self.cleared += 1
+
+        def preload(self, phrases):
+            self.preloaded.append(list(phrases))
+
+    class ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(main_module.threading, "Thread", ImmediateThread)
+    tts = RecordingTTS()
+    processor = CommandProcessor(
+        FakeSTT(),
+        ScriptedRouter(),
+        tts,
+        context=ContextEngine(tmp_path / "nova.db"),
+    )
+
+    response = processor._set_preference("set voice to am_michael")
+
+    assert tts.voice == "am_michael"
+    assert response == "Voice set to am_michael."
+    assert tts.cleared == 1  # the old-voice clips are gone...
+    assert tts.preloaded and MISS_RESPONSE in tts.preloaded[0]  # ...and rebuilt

@@ -15,7 +15,7 @@ from nova_agent.main import CommandProcessor, speakable
 def test_intents_load():
     router = IntentRouter(intents_path=INTENTS_PATH)
 
-    assert len(router.intents) == 17
+    assert len(router.intents) == 18
     assert "read_screen" in router.intents
     assert "greeting" in router.intents
     assert "time_check" in router.intents
@@ -26,6 +26,7 @@ def test_intents_load():
     assert "set_browser" in router.intents
     assert "set_preference" in router.intents
     assert "close_window" in router.intents
+    assert "system_brightness" in router.intents
 
 
 def test_safe_intents_do_not_require_confirmation():
@@ -184,6 +185,20 @@ def test_warm_up_preloads_the_phrasebook(monkeypatch, tmp_path):
 
     assert synthesized == ["Warm up.", "Hello there."]
     assert engine.last_preload_count == 1
+
+
+def test_clear_cache_drops_every_cached_clip(monkeypatch, tmp_path):
+    """The cache is keyed by phrase, not voice: changing the voice must purge
+    clips synthesised with the old one, phrasebook included."""
+    engine = TTSEngine(cache_dir=tmp_path)
+    monkeypatch.setattr(
+        engine, "_synthesize", lambda _text: np.ones(8, dtype=np.float32)
+    )
+    engine.preload(["Hello there.", "Goodbye. Talk to you soon."])
+
+    assert engine.clear_cache() == 2
+    assert list(tmp_path.glob("*.wav")) == []
+    assert engine.clear_cache() == 0  # idempotent: a second purge finds nothing
 
 
 def test_command_captures_are_transcribed_with_the_command_prompt():
@@ -416,7 +431,7 @@ def test_command_processor_controls_volume_in_dry_run():
         FakeTTS(),
     )
 
-    assert processor.process("command.wav") == "Would press volumemute 5 times"
+    assert processor.process("command.wav") == "Would mute the volume"
 
 
 def test_command_processor_reports_a_missing_tesseract_binary(monkeypatch):

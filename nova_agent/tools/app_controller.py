@@ -100,12 +100,37 @@ def resolve_app(name: str) -> Path | None:
 
 
 def open_path(name: str, path: Path, dry_run: bool = True) -> str:
-    """Launch a resolved executable/shortcut with the usual dry-run guard."""
+    """Launch a resolved executable or shortcut with the usual dry-run guard.
+
+    CreateProcess (``subprocess.Popen``) cannot execute a ``.lnk`` shortcut or
+    a directory — live "open microsoft edge" died with WinError 193 "%1 is not
+    a valid Win32 application", because the resolver hands back Start Menu
+    shortcuts (this machine's "chrome" resolves to one too). Shortcuts and
+    folders therefore go through the shell (``os.startfile``, which also keeps
+    a shortcut's own arguments); executables keep the direct Popen, with the
+    shell as one fallback when CreateProcess refuses an unusual file. If
+    neither can launch it, say so instead of raising into the listen loop.
+    """
     if dry_run:
         return f"Would open {name} ({path})"
     if not path.exists():
         return f"App not found: {path}"
-    subprocess.Popen([str(path)])
+    shell_first = path.suffix.lower() == ".lnk" or path.is_dir()
+    try:
+        if shell_first:
+            os.startfile(path)  # the shell opens shortcuts and folders
+        else:
+            subprocess.Popen([str(path)])
+    except OSError as exc:
+        if shell_first:
+            print(f"Shell launch failed for {path}: {exc}")
+            return f"I couldn't open {name}."
+        print(f"CreateProcess refused {path}: {exc}; trying the shell")
+        try:
+            os.startfile(path)
+        except OSError as shell_exc:
+            print(f"Shell launch failed for {path}: {shell_exc}")
+            return f"I couldn't open {name}."
     return f"Opening {name}"
 
 

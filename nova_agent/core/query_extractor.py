@@ -73,6 +73,20 @@ APP_WORDS = {
     "editor": "code",
 }
 
+# Words that point at something instead of naming it ("open it", "open that").
+# A target like this names no app, so it gets the same "Open what?" question a
+# bare launch verb gets — not the "I don't know how to open it yet" refusal.
+PRONOUN_TARGETS = {
+    "it",
+    "that",
+    "this",
+    "them",
+    "those",
+    "these",
+    "something",
+    "anything",
+}
+
 SET_PROJECT_PATTERNS = (
     re.compile(r"set (?:the )?(?:project|folder) (?P<name>.+?) to (?P<path>.+)$"),
     re.compile(r"set (?P<name>.+?) project to (?P<path>.+)$"),
@@ -210,6 +224,11 @@ def extract_app_name(text: str) -> str | None:
     """Return the configured app key mentioned in an open/launch command."""
     phrase = extract_app_phrase(text)
     return APP_WORDS[phrase] if phrase else None
+
+
+def is_pronoun_target(phrase: str) -> bool:
+    """Whether an extracted app phrase points at something instead of naming it."""
+    return (phrase or "").strip().lower() in PRONOUN_TARGETS
 
 
 def parse_set_project(text: str) -> tuple[str | None, str | None]:

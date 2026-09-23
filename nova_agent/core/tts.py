@@ -82,6 +82,19 @@ class TTSEngine:
         self.last_preload_count = created
         return created
 
+    def clear_cache(self) -> int:
+        """Delete every cached clip; returns how many files went.
+
+        Used when the voice changes: the cache is keyed by phrase, not by voice,
+        so clips synthesised with the previous voice would otherwise keep
+        playing — including the whole preloaded phrasebook.
+        """
+        removed = 0
+        for path in self.cache_dir.glob("*.wav"):
+            path.unlink(missing_ok=True)
+            removed += 1
+        return removed
+
     def should_cache(self, text: str) -> bool:
         """Only short, stable phrases are worth keeping on disk."""
         stripped = text.strip()
