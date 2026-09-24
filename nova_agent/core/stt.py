@@ -1,9 +1,47 @@
 import time
 import warnings
+from pathlib import Path
+
+# os.add_dll_directory handles must stay referenced or the directory leaves
+# the search path on garbage collection.
+_DLL_DIRS: list = []
+
+
+def _add_cuda_dll_dirs() -> None:
+    """Windows: put the nvidia pip DLLs (cublas/cudnn) on the DLL search path.
+
+    ctranslate2 loads ``cublas64_12.dll`` lazily at decode time; the pip
+    wheels park it in ``site-packages/nvidia/*/bin``, which is not on PATH —
+    without this every cuda launch silently fell back to CPU ("Library
+    cublas64_12.dll is not found", field round 10).
+    """
+    import os
+
+    if os.name != "nt":
+        return
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("nvidia")
+        if spec is None:
+            return
+        if spec.origin is not None:
+            roots = [Path(spec.origin).parent]
+        else:
+            # Namespace package (PEP 420): origin is None, the search
+            # locations carry site-packages/nvidia.
+            roots = [Path(p) for p in (spec.submodule_search_locations or ())]
+        for root in roots:
+            for bin_dir in root.glob("*/bin"):
+                _DLL_DIRS.append(os.add_dll_directory(str(bin_dir)))
+                os.environ["PATH"] = f"{bin_dir};{os.environ.get('PATH', '')}"
+    except (ImportError, OSError, ValueError):
+        return
 
 
 class STTEngine:
     def __init__(self, model_name: str = "small", device: str = "cpu", compute_type: str = "int8"):
+        _add_cuda_dll_dirs()
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:
@@ -14,7 +52,22 @@ class STTEngine:
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
-        self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        try:
+            self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        except RuntimeError as exc:
+            if device == "cpu":
+                raise
+            # Load-time fallback (cuda is the default device): no usable CUDA
+            # here. Decode-time cuBLAS failures are caught in transcribe();
+            # this covers the model never getting that far.
+            warnings.warn(
+                f"STT could not load on {device} ({exc}); using CPU.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.device = "cpu"
+            self.compute_type = "int8"
+            self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
         self.last_duration: float = 0.0
 
     def warm_up(self) -> float:

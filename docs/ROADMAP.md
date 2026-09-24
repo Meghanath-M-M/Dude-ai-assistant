@@ -363,7 +363,7 @@ thread` plus `QObject::killTimer: Timers cannot be stopped from another thread`.
   at 0.75, placed *after* the example loop so "it's time to open chrome" is
   still an open command.
 - **Identity and help intents** — "what's your name"/"who are you" and
-  "help"/"what can you do" (18 intents now; `length == 18` asserted in
+  "help"/"what can you do" (20 intents now; `length == 20` asserted in
   `tests/test_phase0.py`). The help reply is generated from the capability
   registry, so a disabled destructive action is never advertised.
 - **Misses name the runner-up** — `IntentRouter.match` stores
@@ -417,7 +417,7 @@ thread` plus `QObject::killTimer: Timers cannot be stopped from another thread`.
   `Heard: increase the brightness` scored 0.42 for system_volume — correctly
   refused, but the parser underneath was a trap: `parse_volume_command`
   returned volume-up ("increase" alone was enough). There is now a
-  `system_brightness` intent (target `brightness`, 18 intents total) sharing
+  `system_brightness` intent (target `brightness`, 20 intents total) sharing
   the `system_control` action; `_control_system` picks the device from the
   intent target. `apply_brightness` drives the display's `root\WMI`
   interface through `wmi`/`pywin32` (~50 ms — a PowerShell subprocess would
@@ -462,10 +462,127 @@ thread` plus `QObject::killTimer: Timers cannot be stopped from another thread`.
   name" landed as multi-word Start Menu names (`multi_word_shortcut_names`)
   biased into the command slot's `stt_hotwords()` — long names are the ones
   Whisper mangles; single-word stems stay out of that prompt budget.
+- **Wave 1a: barge-in** — talk over the reply and it stops. `TTSEngine.speak`
+  now streams every segment through one `sd.OutputStream` in ~50ms chunks
+  (`_play_interruptible`), checking `stop()`'s interrupt flag and the barge
+  gate between writes — never the global `sounddevice.stop()`, which would
+  tear down the microphone stream with it. The gate (`core/barge.py`,
+  `BargeGate`) is an *energy* gate with an echo-adaptive baseline: an EMA
+  updated only on below-threshold frames, so a raised voice cannot ratchet
+  the bar against itself, primed from the first post-flush frame (playback
+  bleed — not the command tail `barge_begin` just discarded). Deliberately
+  not Silero: VAD scores our own echo as speech and would cut us off on
+  ourselves. Hooks install in `NovaAgent.run()`; between chunks the worker
+  (blocked in playback) is the only reader of `audio_queue`, so
+  `_barge_check` drains, feeds, and calls `tts.stop()` on a trip — ~50ms
+  detection granularity on top of the 0.3s hold.
+- **Wave 1b: multi-turn "it"** — "open it" resolves against `last_open`, the
+  last app or project actually launched, instead of always asking "Open
+  what?"; with no referent in history it still asks exactly as before.
+  `last_open` rather than `last_text` because the pronoun command itself
+  overwrites `last_text` with "open it" and would lose the target after one
+  use — and the referent then survives an unrelated command in between.
+- **Wave 1c: reminders** — "remind me to stretch in 20 minutes" stores a row in
+  `ContextEngine` (`reminders` table) and the worker loop speaks it when due
+  (`_fire_due_reminders`, throttled to ~1s), marked fired *before* playback so
+  it can never repeat or loop on a synthesis failure; "what are my reminders"
+  lists, "cancel my reminders" clears. `parse_reminder` splits on the **last**
+  " in " (so a reminder may name a place) and reads spoken numbers, "an hour",
+  and "half an hour". The two actions are **not** dry-run gated — a SQLite
+  memory row plus a later spoken reply are both dry-run-safe, exactly like
+  `set_project` — so the default soak exercises them, and reminder speech goes
+  through `tts.speak`, so barge-in applies.
 
-Verification: `python -m pytest` 244 passed (+7 in `tests/test_compound.py`,
-+16 in `tests/test_brightness.py`, +5 launch tests in
-`tests/test_app_resolution.py`; the round-5 follow-up before it added
-`tests/test_volume.py` and the pronoun/recache coverage), the intent
-count/membership asserted at 18 in `tests/test_phase0.py`, `python -m ruff
-check .` clean.
+Verification: `python -m pytest` 294 passed (277 through Wave 1 — +15 Wave 1c in
+`tests/test_reminders.py`, +12 Wave 1 in `tests/test_barge.py`, +6 in
+`tests/test_multiturn_it.py`, +7 in `tests/test_compound.py`, +16 in
+`tests/test_brightness.py`, +5 launch tests in `tests/test_app_resolution.py`;
+the round-5 follow-up before them added `tests/test_volume.py` and the
+pronoun/recache coverage — plus +17 Wave 2 in `tests/test_llm_brain.py`), the
+intent count/membership asserted at 20 in `tests/test_phase0.py`, `python -m
+ruff check .` clean.
+
+- **Wave 2: LLM tool-calling brain** — gated behind `NOVA_LLM_BRAIN=1`
+  (default **off**, pending the Tier 1 baseline). `core/llm_brain.py` builds
+  one tool *per intent* from `intents.json` × `IMPLEMENTED_ACTIONS` and drives
+  Ollama's **native** tool-calling (Tier 2 only parsed a pseudo-function string
+  and could offer three actions). Tier 1 stays the untouched fast path — the
+  brain runs only when `router.match` resolves nothing — and its tools carry no
+  arguments, because each action re-reads details from the transcript through
+  the field-hardened parsers. No tool call = a conversational reply streamed
+  **sentence by sentence** through the Wave 1a chunked/bargeable TTS, with
+  `run_observation` skipping the duplicate `_respond` so it is never spoken
+  twice. A new `llm` budget stage reports brain latency in `--stats` (skipped
+  when absent, so the default brain-off soak is unaffected); every failure —
+  no Ollama, timeout, hallucinated tool, disabled action — degrades to an
+  honest miss. When enabled it supersedes the Tier 2 string fallback.
+
+- **Field round 8: false-wake hardening + Tier 1 baseline** — the first Tier 1
+  soak (53 commands, brain off) recorded: intent (49ms max), tts, action, and
+  total all met budget; **stt over** (median 4.0s, max 11.5s vs the 3.0s
+  budget). Two of the Wave 1 user validations demonstrated live in the same
+  run (barge-in stopped a reply mid-sentence; a reminder fired). The log's
+  false wakes — waking without the phrase, then acting on garbage like
+  "open chrome" — traced to three gaps: the stand-in ONNX model
+  (openWakeWord's `hey_mycroft`) at threshold **0.5** crossing on background
+  chatter, no guard for the post-playback reverb tail, and idle segments
+  buffering to 30s (the stt overrun: one noise segment = a 11.5s
+  transcription on CPU). Fixes: `MODEL_THRESHOLD` **0.5 → 0.65**,
+  `NOVA_WAKE_COOLDOWN` (default 0.5s) dropped in `_on_audio` after every
+  reply via `NovaAgent._finish_speaking`, `NOVA_IDLE_SEGMENT_MAX` (default
+  10s) applied to idle probes only (commands keep `vad_max_seconds`), the
+  wake line now names its source — `Wake detected (audio model|transcript)` —
+  so the next soak shows which detector fired, and `start.bat` sets
+  `NOVA_STT_DEVICE=cuda` (CPU whisper was the other half of the overrun;
+  Dude retries on CPU when cuBLAS is absent). Verification: `python -m
+  pytest` 298 passed, `python -m ruff check .` clean. **Re-soak pending.**
+
+- **Field round 9: voice gate + cuda default** — the 4-command re-soak showed
+  every false wake now coming through the *transcript* path, matching Whisper
+  **prompt echoes** on noise (`Heard: i will use it for the next time` —
+  canned hallucination text — lexically claimed as `time_check`): text alone
+  cannot tell a hallucinated "hey dude" from a real one, because both read
+  the same. And the soak still ran on **cpu** — it was launched as a bare
+  `python -m nova_agent`, so start.bat's env never applied
+  (`STT warm-up: 0.01s on cpu`; stt/intent/total over). Fixes: **voice gate**
+  (`nova_agent/core/voice_gate.py`) — `python -m nova_agent --enroll-voice`
+  records three clips and stores an ECAPA voiceprint; every wake candidate is
+  then checked against it (transcript segment + rolling ~1.5s window for the
+  audio model, `NOVA_VOICE_THRESHOLD` default 0.5), a mismatch prints
+  `[wake] ignored (voice mismatch)` and stays silent, and every accepted
+  transcript wake prints `[wake] matched: '<text>'` so hallucinations are
+  auditable; gate failures (no voiceprint / no speechbrain /
+  `NOVA_VOICE_GATE=0`) degrade open to phrase-only wake. **STT device default
+  cpu → cuda** (`NOVA_STT_DEVICE`) with a load-time CPU fallback in
+  `STTEngine.__init__` (on top of the existing decode-time cuBLAS retry), so
+  any launch style gets the GPU. New deps/settings: `speechbrain` in
+  requirements, `NOVA_VOICE_GATE`/`NOVA_VOICE_THRESHOLD` env rows.
+  Verification: `python -m pytest` 319 passed, `python -m ruff check .` clean.
+  **Re-soak + voice-gate field check pending.**
+
+- **Field round 10: voice-gate calibration + real CUDA** — the first field run
+  with the gate engaged vetoed *every* real wake (`[wake] ignored (voice
+  mismatch): 'hey dude.'` ×3) even though enrollment self-checked at 0.81 —
+  the probe was wrong, not the voice: VAD segments carry silence padding, and
+  ~0.7s wake probes were measured against one long-utterance centroid at
+  threshold 0.5. Fixes: trim to the voiced part before embedding; enroll by
+  carving each clip into 1.5s **probe-length windows** stored as rows (2-D
+  `.npy` — old 1-D centroid voiceprints still load); score = **max cosine
+  over references** (the nearest window, not the centroid); threshold default
+  **0.5 → 0.4** (different-speaker ECAPA scores concentrate below ~0.3, so
+  0.4 is the *confident-mismatch* line); enrollment now reports a
+  leave-one-out self-check **at probe length** (and warns when it sits near
+  the threshold); and every wake line prints the score it judged —
+  `[wake] ignored (voice mismatch 0.32 < 0.4): '<text>'` /
+  `[wake] matched: '<text>' (voice 0.61)` — so thresholds tune from data.
+  Also in this round CUDA stopped being cosmetic: the decode fallback was
+  firing (`Library cublas64_12.dll is not found`) because ctranslate2 loads
+  cuBLAS lazily and the pip wheels park the DLLs off-PATH;
+  `stt.py::_add_cuda_dll_dirs` puts `site-packages/nvidia/*/bin` on the DLL
+  search path (a PEP 420 namespace package has `origin is None` — which
+  silently defeated the first attempt), backed by `nvidia-cublas-cu12` +
+  `nvidia-cudnn-cu12` in requirements. Steady-state STT on cuda: **0.07s**
+  for a 2s clip (CPU: seconds) — the stt budget should now be met.
+  **Re-enroll recommended** (window references + the new self-check), then
+  re-soak + voice-gate field check. Verification: `python -m pytest` 325
+  passed, `python -m ruff check .` clean.

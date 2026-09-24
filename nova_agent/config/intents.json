@@ -38,6 +38,26 @@
     "safe": true,
     "examples": ["open my project", "launch my workspace", "open my ml folder", "open the project folder"]
   },
+  "remind_me": {
+    "action": "set_reminder",
+    "safe": true,
+    "examples": [
+      "remind me to take medicine in 10 minutes",
+      "remind me to stretch in an hour",
+      "remind me to drink water in 30 minutes",
+      "reminder to call mom in 5 minutes"
+    ]
+  },
+  "manage_reminders": {
+    "action": "manage_reminders",
+    "safe": true,
+    "examples": [
+      "what are my reminders",
+      "list my reminders",
+      "cancel my reminders",
+      "clear my reminders"
+    ]
+  },
   "greeting": {
     "action": "greet",
     "safe": true,

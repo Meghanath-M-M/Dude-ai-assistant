@@ -51,9 +51,13 @@ def test_budgets_match_field_measurements():
     # Two field rounds: a 2-command probe, then 13 real commands (stt max
     # 2.8s, intent max 126ms warm, tts counts synthesis-to-audio only, total
     # is wall clock including speaking the reply — max 13.8s on the longest).
+    # llm is Wave 2: model-dependent, present only when the brain engages —
+    # the field rounds ran brain-off, so 4.0s is an allowance, not a
+    # measurement (it covers a local phi4-mini/qwen tool round-trip).
     assert LATENCY_BUDGETS == {
         "stt": 3.0,
         "intent": 0.2,
+        "llm": 4.0,
         "tts": 2.5,
         "action": 0.5,
         "total": 15.0,

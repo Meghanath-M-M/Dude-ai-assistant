@@ -10,3 +10,6 @@ memory/*.db
 assets/tts_cache/*
 assets/wake_word/*.onnx
 assets/wake_word/*.tflite
+# Voice gate (round 9): enrolled vector + once-downloaded ECAPA model.
+assets/voiceprint.npy
+assets/speaker_model/

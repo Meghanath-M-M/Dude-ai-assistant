@@ -15,7 +15,7 @@ from nova_agent.main import CommandProcessor, speakable
 def test_intents_load():
     router = IntentRouter(intents_path=INTENTS_PATH)
 
-    assert len(router.intents) == 18
+    assert len(router.intents) == 20
     assert "read_screen" in router.intents
     assert "greeting" in router.intents
     assert "time_check" in router.intents
@@ -153,13 +153,27 @@ def test_a_preloaded_reply_is_served_from_the_cache(monkeypatch, tmp_path):
 
     monkeypatch.setattr(engine, "_synthesize", fake_synthesize)
     played: list[int] = []
+
+    class _Stream:
+        def __init__(self, **_kw):
+            pass
+
+        def start(self):
+            pass
+
+        def write(self, data):
+            played.append(len(data))
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
     monkeypatch.setitem(
         sys.modules,
         "sounddevice",
-        types.SimpleNamespace(
-            play=lambda data, rate: played.append(len(data)),
-            wait=lambda: None,
-        ),
+        types.SimpleNamespace(OutputStream=_Stream),
     )
     reply = f"Screen reading is unavailable. {TESSERACT_MISSING_MESSAGE}"
     engine.preload([reply])

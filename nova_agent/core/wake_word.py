@@ -25,8 +25,11 @@ class WakeWordEngine:
     """
 
     # Classifier scores and loudness scores live on different scales, so the
-    # trigger point depends on which detector actually loaded.
-    MODEL_THRESHOLD = 0.5
+    # trigger point depends on which detector actually loaded. The stand-in
+    # model (openWakeWord's hey_mycroft) crossed 0.5 on background chatter
+    # (field round 8 false wakes), so the default sits higher now; the spoken
+    # "set wake threshold to <x>" or --wake-threshold still tunes it per room.
+    MODEL_THRESHOLD = 0.65
     ENERGY_THRESHOLD = 0.13
 
     @staticmethod

@@ -218,6 +218,126 @@ def looks_like_open_command(text: str) -> bool:
     )
 
 
+# "remind me to <what> in <when>": the openers for a reminder, and the units a
+# spoken duration can name. Durations are relative ("in 10 minutes") because
+# that is how people actually ask; absolute clock times need date maths this
+# feature does not do yet. Longest match wins, so "remind me to " is tried
+# before "remind me " and the "to" is not left glued to the reminder text.
+REMINDER_TRIGGERS = (
+    "remind me to ",
+    "remind me ",
+    "reminder to ",
+    "don't let me forget to ",
+    "do not let me forget to ",
+)
+
+_DURATION_UNITS = {
+    "second": 1,
+    "seconds": 1,
+    "sec": 1,
+    "secs": 1,
+    "minute": 60,
+    "minutes": 60,
+    "min": 60,
+    "mins": 60,
+    "hour": 3600,
+    "hours": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "day": 86400,
+    "days": 86400,
+}
+
+# Spoken numbers: Whisper writes "ten minutes" as often as "10 minutes".
+_NUMBER_WORDS = {
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+}
+
+
+def _parse_duration(phrase: str) -> int | None:
+    """Seconds in a spoken duration ("10 minutes", "an hour", "half an hour")."""
+    cleaned = " ".join(phrase.strip().strip(_TRAILING_PUNCTUATION).split()).lower()
+    if not cleaned:
+        return None
+    if cleaned in {"half an hour", "half hour"}:
+        return 1800
+    tokens = cleaned.split()
+    if len(tokens) >= 2:
+        count = _NUMBER_WORDS.get(tokens[0])
+        if count is None:
+            try:
+                count = float(tokens[0])
+            except ValueError:
+                count = None
+        if count is not None:
+            multiplier = _DURATION_UNITS.get(tokens[1].strip("."))
+            if multiplier is not None:
+                return int(count * multiplier)
+    return None
+
+
+def parse_reminder(text: str) -> tuple[str, int] | None:
+    """Split "remind me to stretch in 20 minutes" into ``("stretch", 1200)``.
+
+    Splits on the **last** " in " so a reminder can itself mention a place
+    ("remind me to meet john in the lab in 10 minutes"). Returns ``None`` when
+    the phrase is not a reminder or names no duration, so the caller can ask
+    "in how long?" instead of inventing a deadline.
+    """
+    normalized = " ".join(text.strip().lower().split())
+    for trigger in REMINDER_TRIGGERS:
+        if not normalized.startswith(trigger):
+            continue
+        body = normalized[len(trigger) :].strip()
+        parts = re.split(r"\bin\s+", body)
+        if len(parts) < 2:
+            return None
+        delay = _parse_duration(parts[-1])
+        if delay is None:
+            return None
+        what = " ".join(" in ".join(parts[:-1]).split()).strip(_TRAILING_PUNCTUATION)
+        if not what:
+            return None
+        return what, delay
+    return None
+
+
+def humanize_delay(seconds: int) -> str:
+    """Speakable duration for a confirmation ("an hour", "5 minutes")."""
+    if seconds >= 3600 and seconds % 3600 == 0:
+        hours = seconds // 3600
+        return "an hour" if hours == 1 else f"{hours} hours"
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = seconds // 60
+        return "a minute" if minutes == 1 else f"{minutes} minutes"
+    return "a second" if seconds == 1 else f"{seconds} seconds"
+
+
 def extract_app_phrase(text: str) -> str | None:
     """Return the app phrase as spoken ("vs code"), or ``None``.
 

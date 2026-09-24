@@ -27,6 +27,7 @@ python -m nova_agent --listen --live         # hands-free, and really open thing
 python -m nova_agent --calibrate             # two-step wizard: ambient energy, then 5x "hey dude"
 python -m nova_agent --wake-status           # wake phrase, backend, model path, threshold, last score
 python -m nova_agent --wake-probe            # record wake attempts: transcript hits + model threshold
+python -m nova_agent --enroll-voice          # record your voice so only you can wake Dude
 python -m nova_agent --listen --debug        # live energy + timing output
 python -m nova_agent --listen --stats        # latency summary (min/median/mean/max vs budget) on exit
 python -m pytest                             # run the test suite
@@ -57,8 +58,13 @@ Two detectors run while `--listen` is idle, and they work differently:
   wake phrase** (`initial_prompt`) — unprompted Whisper systematically mishears
   short phrases on some voices ("what are you doing?" for "hey dude") — and
   segments below an RMS floor (`wake_segment_min_rms`) are skipped so
-  near-silence never reaches the decoder. Every exchange is visible on the
-  console as it happens: `Wake detected - listening for your command.` →
+  near-silence never reaches the decoder. After every reply the mic is deaf
+  for `wake_cooldown` (0.5 s, `NOVA_WAKE_COOLDOWN`) so the room's own reverb
+  tail can't trigger a wake, and idle probes are capped at `idle_segment_max`
+  (10 s, `NOVA_IDLE_SEGMENT_MAX`) so background chatter can't drag one
+  segment into a multi-second transcription. Every exchange is visible on the
+  console as it happens: `Wake detected (transcript) - listening for your
+  command.` — the source in parentheses names which detector fired — then
   `Heard: ...` / `Intent: ...` (misses show *why*: `Heard: (nothing
   intelligible)` or `Intent: none (best score 0.51 for time_check, below the
   confidence band)` — the runner-up intent is named, so a near miss is
@@ -97,6 +103,24 @@ Two detectors run while `--listen` is idle, and they work differently:
   `hey_mycroft_v0.1.onnx`, so it fires on **"hey mycroft"**, not "hey dude" —
   a bonus trigger, not the main one. A real `hey dude` model can replace it
   later via openWakeWord training.
+- **Voice gate (speaker check)** — `python -m nova_agent --enroll-voice`
+  records three short clips (~15 s), carves them into probe-length (1.5 s)
+  reference windows, and stores their embeddings (`assets/voiceprint.npy`).
+  From then on every wake candidate — the transcribed idle segment, or a
+  rolling ~1.5 s window for the audio model — is trimmed to its voiced part
+  and must be *your* voice (speechbrain ECAPA, cosine similarity vs the
+  **nearest** reference ≥ `NOVA_VOICE_THRESHOLD`, default 0.4 — only a
+  *confident* mismatch vetoes, since different-speaker scores concentrate
+  below ~0.3). This is what separates a Whisper
+  **prompt echo** (the phrase "transcribed" out of noise — the same *text* a
+  real wake produces) and a stranger or a video saying "hey dude" from you:
+  noise has no speaker, and other voices aren't yours. Every line shows the
+  score it judged: accepted transcript wakes print
+  `[wake] matched: '...' (voice 0.61)`; rejected ones print
+  `[wake] ignored (voice mismatch 0.32 < 0.4): '...'` and stay silent.
+  No voiceprint, a missing
+  `speechbrain` install, or `NOVA_VOICE_GATE=0` leaves the gate open —
+  phrase-only wake, exactly as before.
 
 Wake latency for the transcript path is roughly the end of the phrase plus one
 short transcription (~0.5–1 s). Use `--calibrate` to see per-attempt HIT/miss
@@ -119,6 +143,9 @@ results through the real pipeline.
 | "what can you do", "help" | Lists what is actually enabled |
 | "increase brightness and open microsoft edge" | Compound commands run every matching clause in turn (risky clauses still ask first) |
 | "open" (no app named) | Asks **"Open what?"** — never opens a default app |
+| "open it" (after opening something) | Reopens the last app or project — asks only when history names nothing |
+| "remind me to stretch in 20 minutes" | Stores a reminder in SQLite and speaks it when it comes due (you can talk over it) |
+| "what are my reminders", "cancel my reminders" | Lists pending reminders, or clears them all |
 
 Two rules keep the guessing out of the pipeline:
 
@@ -132,24 +159,32 @@ Two rules keep the guessing out of the pipeline:
 
 Wake word, hands-free capture, and everything above are wired through a worker
 thread, so microphone frames are never dropped while Whisper or Kokoro runs, and
-Dude cannot trigger itself on its own speech.
+Dude cannot trigger itself on its own speech. You can also **talk over it**: while
+a reply is playing, a voice sustained well above the playback echo stops it
+mid-sentence — an echo-adaptive energy gate, because Dude's own voice comes back
+through the mic too and a fixed threshold would cut him off on himself.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `NOVA_DRY_RUN` | `1` | `0` executes actions instead of describing them |
-| `NOVA_STT_DEVICE` | `cpu` | `cuda` uses the GPU when cuBLAS is available |
+| `NOVA_STT_DEVICE` | `cuda` | `cpu` forces Whisper onto the CPU; CUDA falls back to CPU if unavailable |
 | `NOVA_TESSERACT_PATH` | unset | Path to `tesseract.exe` for screen reading |
 | `NOVA_LLM_FALLBACK` | `0` | `1` enables the optional Ollama Tier 2 router |
 | `NOVA_LLM_MODEL` | `phi4-mini` | Ollama model the Tier 2 router asks for |
 | `NOVA_LLM_MIN_SCORE` | `0.65` | Tier 1 scores below this never reach the LLM |
+| `NOVA_LLM_BRAIN` | `0` | `1` enables the Wave 2 tool-calling brain (needs Ollama + a tool-capable model) |
 | `NOVA_TRANSCRIPT_WAKE` | `1` | `0` disables transcript wake (audio model only) |
+| `NOVA_WAKE_COOLDOWN` | `0.5` | Seconds of mic deafness after each reply (reverb-tail guard) |
+| `NOVA_IDLE_SEGMENT_MAX` | `10` | Max seconds of idle probe audio sent to STT (commands keep 30) |
+| `NOVA_VOICE_GATE` | `1` | `0` keeps phrase-only wake (no speaker check) |
+| `NOVA_VOICE_THRESHOLD` | `0.4` | Cosine below which a wake voice is confidently "someone else" |
 | `NOVA_CHROME_PATH` | Program Files | Chrome executable |
 | `NOVA_CODE_PATH` | `%LOCALAPPDATA%` | VS Code executable |
 
 Tunables live in `nova_agent/config/settings.py` (wake phrase: `wake_word`,
-default `"hey dude"`); the 18 task definitions live in
+default `"hey dude"`); the 20 task definitions live in
 `nova_agent/config/intents.json`.
 
 Command captures are primed twice for Whisper: an `initial_prompt` built from
@@ -177,7 +212,9 @@ which includes the long ones the cache policy would otherwise refuse to store
 - **Ollama** for the Tier 2 fallback. `start.bat` sets `NOVA_LLM_FALLBACK=1`
   before launching; pull the default model once with `ollama pull phi4-mini`
   (~2.5 GB). When the daemon or model is missing the fallback just answers
-  `unknown`, so the voice loop never stalls.
+  `unknown`, so the voice loop never stalls. The Wave 2 brain
+  (`NOVA_LLM_BRAIN=1`, default off) uses the same Ollama setup but needs a
+  tool-capable model; it supersedes this fallback when enabled.
 
 Dude prefers CUDA for faster-whisper. If the CUDA cuBLAS DLLs are unavailable,
 it automatically retries transcription on the CPU. This is slower but does not

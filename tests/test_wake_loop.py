@@ -6,7 +6,7 @@ from nova_agent.main import NovaAgent
 
 
 def test_wake_word_threshold_defaults_follow_the_active_backend():
-    assert WakeWordEngine.resolve_threshold(None, using_model=True) == 0.5
+    assert WakeWordEngine.resolve_threshold(None, using_model=True) == 0.65
     assert WakeWordEngine.resolve_threshold(None, using_model=False) == 0.13
     assert WakeWordEngine.resolve_threshold(0.35, using_model=True) == 0.35
 

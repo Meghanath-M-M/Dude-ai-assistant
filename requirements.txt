@@ -21,6 +21,15 @@ pygetwindow>=0.0.9,<1
 pyautogui>=0.9.54,<1
 playwright>=1.45,<2
 openwakeword>=0.6,<1
+# Speaker verification for the wake voice gate (python -m nova_agent
+# --enroll-voice); the ECAPA model downloads once to assets/speaker_model.
+# 1.0+: 0.5.x calls torchaudio.set_audio_backend, removed in torchaudio 2.9+.
+speechbrain>=1.0,<2
+# CUDA decode for faster-whisper: ctranslate2 loads cublas64_12.dll lazily and
+# the pip wheels park it off-PATH — stt.py::_add_cuda_dll_dirs wires it up,
+# and without these the GPU silently falls back to CPU transcription.
+nvidia-cublas-cu12>=12
+nvidia-cudnn-cu12>=9
 PyQt5>=5.15,<6
 
 # Optional Tier 2 LLM fallback (enable with NOVA_LLM_FALLBACK=1; needs the

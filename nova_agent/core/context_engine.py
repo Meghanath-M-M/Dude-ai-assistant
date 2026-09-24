@@ -34,6 +34,12 @@ class ContextEngine:
                 alias TEXT PRIMARY KEY,
                 app_key TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY,
+                text TEXT NOT NULL,
+                fire_at INTEGER NOT NULL,
+                fired INTEGER NOT NULL DEFAULT 0
+            );
         """)
         self.connection.commit()
 
@@ -129,3 +135,42 @@ class ContextEngine:
             (key,),
         ).fetchone()
         return row[0] if row else default
+
+    def add_reminder(self, text: str, fire_at: int) -> int:
+        """Store a reminder to speak at ``fire_at`` (unix seconds); returns its id."""
+        cursor = self.connection.execute(
+            "INSERT INTO reminders (text, fire_at) VALUES (?, ?)",
+            (text.strip(), int(fire_at)),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def due_reminders(self, now: int) -> list[tuple[int, str]]:
+        """Unfired reminders whose time has come, oldest first: ``(id, text)``."""
+        rows = self.connection.execute(
+            "SELECT id, text FROM reminders "
+            "WHERE fired = 0 AND fire_at <= ? ORDER BY fire_at",
+            (int(now),),
+        ).fetchall()
+        return [(int(row[0]), row[1]) for row in rows]
+
+    def mark_reminder_fired(self, reminder_id: int) -> None:
+        self.connection.execute(
+            "UPDATE reminders SET fired = 1 WHERE id = ?", (int(reminder_id),)
+        )
+        self.connection.commit()
+
+    def pending_reminders(self, now: int) -> list[tuple[str, int]]:
+        """Unfired reminders still in the future: ``(text, fire_at)``."""
+        rows = self.connection.execute(
+            "SELECT text, fire_at FROM reminders "
+            "WHERE fired = 0 AND fire_at > ? ORDER BY fire_at",
+            (int(now),),
+        ).fetchall()
+        return [(row[0], int(row[1])) for row in rows]
+
+    def clear_reminders(self) -> int:
+        """Drop every unfired reminder; returns how many were removed."""
+        cursor = self.connection.execute("DELETE FROM reminders WHERE fired = 0")
+        self.connection.commit()
+        return int(cursor.rowcount)

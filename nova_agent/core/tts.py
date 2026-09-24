@@ -36,6 +36,13 @@ class TTSEngine:
         self.last_synthesis_seconds: float = 0.0
         # How many canonical replies the last preload had to synthesise.
         self.last_preload_count: int = 0
+        # Barge-in hooks, installed by NovaAgent on the listen loop. begin()
+        # fires once when playback opens (flush stale frames, reset the gate);
+        # check() runs between ~50ms chunks and returns True to cut us off.
+        # _interrupt is the thread-safe flag stop() raises from any thread.
+        self.barge_begin = None
+        self.barge_check = None
+        self._interrupt = threading.Event()
 
     def warm_up(self, phrases: Iterable[str] = ()) -> float:
         """Build the pipeline, pay the first-synthesis tax, cache ``phrases``.
@@ -104,6 +111,17 @@ class TTSEngine:
             return False
         return not any(character.isdigit() for character in stripped)
 
+    def stop(self) -> None:
+        """Interrupt current (or arming) playback so the user can talk over it.
+
+        Thread-safe: it only raises a flag, which the playback loop notices at
+        the next ~50ms chunk boundary. Deliberately does *not* call the global
+        ``sounddevice.stop()`` — that would tear down the microphone stream
+        too. Each ``speak()`` clears the flag first, so a stop raised while we
+        were idle cannot swallow a later, unrelated reply.
+        """
+        self._interrupt.set()
+
     def speak(self, text: str) -> None:
         """Play ``text`` using the cache, a cached prefix, or fresh synthesis."""
         self.last_synthesis_seconds = 0.0  # cache hits truly start instantly
@@ -112,18 +130,23 @@ class TTSEngine:
         except ImportError as exc:
             raise RuntimeError("TTS playback requires sounddevice.") from exc
 
+        # A fresh reply starts uninterruptible; the barge gate arms it below.
+        self._interrupt.clear()
+        if self.barge_begin is not None:
+            self.barge_begin()  # flush pre-playback frames, reset the gate
+
         cached = self._read_wav(self._cache_path(text))
         if cached is not None:
-            sd.play(cached[1], cached[0])
-            sd.wait()
+            self._play_interruptible(sd, cached[1], cached[0])
             return
 
         prefix_path, remainder = self._cached_prefix_split(text)
         if prefix_path is not None and remainder:
             prefix = self._read_wav(prefix_path)
             if prefix is not None:
-                sd.play(prefix[1], prefix[0])
-                sd.wait()
+                self._play_interruptible(sd, prefix[1], prefix[0])
+            if self._interrupt.is_set():
+                return  # the user cut us off mid-prefix; drop the tail too
             # Only the tail is new, so the reply starts on the first syllable.
             self._synthesize_and_play(sd, remainder)
             return
@@ -138,8 +161,52 @@ class TTSEngine:
             from scipy.io import wavfile
 
             self._write_cache(wavfile, self._cache_path(text), audio)
-        sd.play(audio, 24_000)
-        sd.wait()
+        if self._interrupt.is_set():
+            return  # interrupted while synthesising; the user has moved on
+        self._play_interruptible(sd, audio, 24_000)
+
+    def _play_interruptible(self, sd, audio, samplerate: int) -> None:
+        """Stream ``audio`` in ~50ms chunks so it can be cut short.
+
+        One OutputStream fed by sequential blocking writes plays continuously
+        (no per-chunk gaps, unlike a fresh ``sd.play`` per slice). Checking the
+        interrupt flag and the barge gate between writes bounds time-to-stop at
+        roughly one chunk — and because we simply stop writing rather than
+        calling ``sounddevice.stop()``, the microphone stream is never touched.
+        """
+        data = self._to_float32(audio)
+        if data.size == 0:
+            return
+        chunk = max(1, int(samplerate * 0.05))
+        stream = sd.OutputStream(samplerate=samplerate, channels=1, dtype="float32")
+        stream.start()
+        try:
+            for start in range(0, data.shape[0], chunk):
+                if self._interrupt.is_set():
+                    return
+                stream.write(data[start : start + chunk])
+                # Only after real audio is out: the frames queued during this
+                # chunk are the echo of what we just said plus any voice over
+                # it, and barge_begin already flushed the earlier backlog.
+                if self.barge_check is not None and self.barge_check():
+                    self._interrupt.set()
+                    return
+        finally:
+            stream.stop()
+            stream.close()
+
+    @staticmethod
+    def _to_float32(audio):
+        """Coerce any cached/fresh audio to mono float32 in [-1, 1]."""
+        import numpy as np
+
+        data = np.asarray(audio)
+        if np.issubdtype(data.dtype, np.integer):
+            scale = float(np.iinfo(data.dtype).max or 1)
+            data = data.astype(np.float32) / scale
+        else:
+            data = data.astype(np.float32, copy=False)
+        return np.clip(data, -1.0, 1.0).reshape(-1, 1)
 
     def _synthesize(self, text: str):
         # One lock around build *and* synthesis: the background warm thread

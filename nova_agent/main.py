@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from nova_agent.config.settings import (
     Settings,
     ensure_directories,
 )
+from nova_agent.core.barge import BargeGate
 from nova_agent.core.capabilities import CapabilityRegistry
 from nova_agent.core.context_engine import ContextEngine
 from nova_agent.core.intent_router import IntentRouter
@@ -27,8 +29,10 @@ from nova_agent.core.query_extractor import (
     extract_app_phrase,
     extract_project_name,
     extract_search_query,
+    humanize_delay,
     is_pronoun_target,
     looks_like_open_command,
+    parse_reminder,
     parse_set_browser,
     parse_set_preference,
     parse_set_project,
@@ -43,6 +47,7 @@ from nova_agent.core.safety import (
     requires_confirmation,
 )
 from nova_agent.core.vad import VADRecorder
+from nova_agent.core.voice_gate import VoiceGate, enroll_voice
 from nova_agent.core.wake_phrase import wake_phrase_hits
 from nova_agent.core.wake_word import WakeWordEngine
 from nova_agent.tools.app_controller import (
@@ -74,9 +79,14 @@ def time_of_day_greeting(now: datetime | None = None) -> str:
 
 
 def build_router(settings: Settings, capabilities=None) -> IntentRouter:
-    """Create the Tier 1 router, optionally with the Tier 2 LLM fallback."""
+    """Create the Tier 1 router, optionally with the Tier 2 LLM fallback.
+
+    The Wave 2 brain (``NOVA_LLM_BRAIN=1``) supersedes this string-parsing
+    fallback: both would compete for the same below-threshold band, and the
+    brain's native tool-calling is strictly the better of the two.
+    """
     router = IntentRouter(settings.intent_threshold, fallback_floor=settings.llm_min_score)
-    if settings.llm_fallback:
+    if settings.llm_fallback and not settings.llm_brain:
         from nova_agent.core.llm_fallback import LLMFallback
 
         router.fallback = LLMFallback(
@@ -103,6 +113,8 @@ IMPLEMENTED_ACTIONS = (
     "set_project",
     "set_browser",
     "set_preference",
+    "set_reminder",
+    "manage_reminders",
     "close_window",
     "tidy_downloads",
     "lock_workstation",
@@ -124,6 +136,8 @@ ACTION_LABELS = {
     "set_project": "remember projects",
     "set_browser": "switch browsers",
     "set_preference": "change my settings",
+    "set_reminder": "set reminders",
+    "manage_reminders": "list or cancel reminders",
     "close_window": "close windows",
     "tidy_downloads": "tidy downloads",
     "lock_workstation": "lock the workstation",
@@ -197,7 +211,26 @@ class CommandProcessor:
         self._shortcut_names: set[str] | None = None
         self.last_intent: dict | None = None
         self.last_text: str = ""
+        # The referent for a follow-up "open it"/"open that": the last app or
+        # project actually opened. Kept separate from last_text, which the
+        # pronoun command itself would otherwise overwrite (losing the target).
+        self.last_open: dict | None = None
         self.timings: dict[str, float] = {}
+        # Wave 2 brain: built only when NOVA_LLM_BRAIN=1 (default off, pending
+        # the Tier 1 baseline). Its tools come from this router's intents
+        # crossed with the dispatcher's runnable actions; the capability
+        # registry gates whatever the model proposes.
+        self.llm_brain = None
+        if self.settings.llm_brain:
+            from nova_agent.core.llm_brain import LLMBrain
+
+            self.llm_brain = LLMBrain(
+                model=self.settings.llm_model,
+                timeout=self.settings.llm_timeout,
+                capabilities=self.capabilities,
+                intents=getattr(self.router, "intents", {}),
+                implemented=IMPLEMENTED_ACTIONS,
+            )
 
     def transcribe(
         self,
@@ -274,8 +307,51 @@ class CommandProcessor:
             # exactly as before (any partial match above is discarded).
             intent, score = self.router.match(text)
             head = {"text": text, "intent": intent, "score": score}
+        # Tier 1's time only — the brain below gets its own `llm` stage, so a
+        # slow model can never masquerade as a slow embedding match.
         self.timings["intent"] = time.perf_counter() - started
+        if head["intent"] is None and self.llm_brain is not None:
+            self._brain_decide(head)
         return head
+
+    def _brain_decide(self, head: dict) -> None:
+        """Let the Wave 2 brain resolve a phrase Tier 1 could not (mutates ``head``).
+
+        A tool call becomes that intent, executed normally downstream. A
+        conversational reply is streamed sentence by sentence through the
+        chunked, bargeable TTS *here*, and ``head`` is marked ``llm_reply`` so
+        ``run_observation`` won't speak it a second time.
+        """
+        text = head.get("text", "")
+        speak_seconds = 0.0
+
+        def _speak(sentence: str) -> None:
+            nonlocal speak_seconds
+            call_started = time.perf_counter()
+            self.tts.speak(speakable(sentence))
+            # The same synthesis-vs-playback rule _respond uses: an engine that
+            # self-reports wins, fakes (and engines without the marker) keep the
+            # whole — short — call.
+            synth = getattr(self.tts, "last_synthesis_seconds", None)
+            speak_seconds += (
+                (time.perf_counter() - call_started) if synth is None else synth
+            )
+
+        started = time.perf_counter()
+        decision = self.llm_brain.decide(text, on_sentence=_speak)
+        self.timings["llm"] = time.perf_counter() - started
+        if decision.tool_intent is not None:
+            head["intent"] = decision.tool_intent
+            head["score"] = decision.score
+        elif decision.reply_text is not None:
+            head["intent"] = {
+                "action": "llm_reply",
+                "safe": True,
+                "reply": decision.reply_text,
+            }
+            head["score"] = decision.score
+            self.timings["tts"] = speak_seconds
+        # else: leave the miss alone — the honest "I didn't catch that".
 
     def respond(self, message: str) -> str:
         """Speak a message without executing anything (used for cancellations)."""
@@ -308,6 +384,14 @@ class CommandProcessor:
             total_action += self.timings.pop("action", 0.0)
         if total_action:
             self.timings["action"] = total_action
+        head_intent = observation.get("intent") or {}
+        if head_intent.get("action") == "llm_reply":
+            # The brain streamed and spoke this answer sentence by sentence
+            # while it generated; re-speaking it here would play it twice. The
+            # console still gets the text (timings["tts"] was set by the
+            # streaming path in _brain_decide).
+            print(f"Response: {response}")
+            return response
         return self._respond(response)
 
     def _run_one(self, observation: dict, confirmed: bool = False) -> str:
@@ -356,6 +440,11 @@ class CommandProcessor:
         action = intent["action"]
         print(f"Heard: {text}")
         print(f"Intent: {action} ({score:.2f})")
+
+        if action == "llm_reply":
+            # The brain already streamed and spoke this answer (observe did the
+            # talking); just carry the text back so console and stats see it.
+            return intent.get("reply", "")
 
         # Confirmation comes first: a risky action should be announced before
         # anything else is decided about it.
@@ -445,7 +534,48 @@ class CommandProcessor:
 
             return lock_workstation(dry_run=self.dry_run)
 
+        if action == "set_reminder":
+            return self._set_reminder(text)
+
+        if action == "manage_reminders":
+            return self._manage_reminders(text)
+
         return f"The {action.replace('_', ' ')} action is not enabled yet"
+
+    def _set_reminder(self, text: str) -> str:
+        """Schedule a spoken reminder.
+
+        Stored in **both** dry-run and live mode, deliberately: like
+        ``set_project``/``set_browser`` this is a SQLite memory write plus a
+        later spoken reply, and neither is a world action dry-run exists to
+        suppress — so the reminder works identically in the default soak.
+        """
+        if self.context is None:
+            return "I can't set reminders without a memory store."
+        parsed = parse_reminder(text)
+        if parsed is None:
+            return "Tell me when — like: remind me to stretch in 20 minutes."
+        what, delay = parsed
+        self.context.add_reminder(what, int(time.time()) + delay)
+        return f"Okay — I'll remind you to {what} in {humanize_delay(delay)}."
+
+    def _manage_reminders(self, text: str) -> str:
+        """List pending reminders, or drop them all on a cancel word."""
+        if self.context is None:
+            return "I can't keep reminders without a memory store."
+        lowered = text.lower()
+        if any(word in lowered for word in ("cancel", "clear", "delete")):
+            removed = self.context.clear_reminders()
+            if removed == 0:
+                return "You have no reminders to clear."
+            plural = "s" if removed != 1 else ""
+            return f"Cleared {removed} reminder{plural}."
+        pending = self.context.pending_reminders(int(time.time()))
+        if not pending:
+            return "You have no reminders pending."
+        names = ", ".join(what for what, _ in pending)
+        plural = "s" if len(pending) != 1 else ""
+        return f"You have {len(pending)} reminder{plural} pending: {names}."
 
     def _respond(self, response: str) -> str:
         started = time.perf_counter()
@@ -489,6 +619,8 @@ class CommandProcessor:
             return "I don't know where that is. Say set project ml to a folder path."
 
         label = name or "default"
+        # Record as the referent so a later "open it" reopens this project.
+        self.last_open = {"action": "context_open", "text": text}
         if self.dry_run:
             return f"Would open project {label} at {path}"
 
@@ -522,10 +654,12 @@ class CommandProcessor:
         """Open the app that was named, or say honestly that we cannot."""
         phrase = extract_app_phrase(text)
         if phrase is not None and is_pronoun_target(phrase):
-            # "open it" / "open that": a pronoun names nothing, exactly like a
-            # bare launch verb, so ask which app instead of answering "I don't
-            # know how to open it yet." The answer then fills in the target.
-            phrase = None
+            # "open it" / "open that": resolve against what we opened last so
+            # a follow-up never repeats the name. Only real history answers;
+            # with none, fall back to asking — exactly like a bare verb.
+            reopened = self._resolve_open_pronoun()
+            if reopened is not None:
+                return reopened
             self.pending_clarification = "open_app"
             return OPEN_WHAT_RESPONSE
         if phrase is None:
@@ -544,6 +678,13 @@ class CommandProcessor:
             # No app named at all (for example a bare "chrome"): trust the intent.
             phrase = str(target)
 
+        return self._launch_phrase(phrase)
+
+    def _launch_phrase(self, phrase: str) -> str:
+        """Open one concrete, already-named app phrase (the resolution tail).
+
+        Also records the opened app as the referent for a later "open it".
+        """
         alias = self.context.get_alias(phrase) if self.context is not None else None
         key = alias or APP_WORDS.get(phrase, phrase)
         if key not in APP_PATHS:
@@ -552,8 +693,28 @@ class CommandProcessor:
             resolved = resolve_app(key)
             if resolved is None:
                 return f"I don't know how to open {key} yet."
+            self.last_open = {"action": "open_app", "text": phrase}
             return open_path(key, resolved, dry_run=self.dry_run)
+        self.last_open = {"action": "open_app", "text": phrase}
         return open_app(key, dry_run=self.dry_run)
+
+    def _resolve_open_pronoun(self) -> str | None:
+        """Reopen whatever "it"/"that" points at: the last thing we opened.
+
+        ``last_open`` — not ``last_text`` — is the referent, so the pronoun is
+        reusable and survives an unrelated command in between. ``last_text``
+        would become the pronoun itself after one use and lose the target.
+        Returns ``None`` when history names nothing to reopen.
+        """
+        referent = self.last_open
+        if not referent:
+            return None
+        action = referent.get("action")
+        if action == "context_open":
+            return self._open_project(referent["text"])
+        if action == "open_app":
+            return self._launch_phrase(referent["text"])
+        return None
 
     def _set_project(self, text: str) -> str:
         if self.context is None:
@@ -728,7 +889,17 @@ class CommandProcessor:
 # total is wall clock including *speaking* the reply (paths are never spoken,
 # see speakable()), so it is content-bound and deliberately generous;
 # stages carry the performance signal.
-LATENCY_BUDGETS = {"stt": 3.0, "intent": 0.2, "tts": 2.5, "action": 0.5, "total": 15.0}
+# `llm` (Wave 2) is model-dependent and only present when the brain engages —
+# format_stats skips stages with no samples, so the default brain-off soak is
+# unaffected. 4.0s covers a local phi4-mini/qwen tool round-trip.
+LATENCY_BUDGETS = {
+    "stt": 3.0,
+    "intent": 0.2,
+    "llm": 4.0,
+    "tts": 2.5,
+    "action": 0.5,
+    "total": 15.0,
+}
 
 
 def format_stats(history: list[dict[str, float]]) -> str:
@@ -835,6 +1006,7 @@ class NovaAgent:
         stt_device: str | None = None,
         stats: bool = False,
         transcript_wake: bool | None = None,
+        voice_gate=None,
     ):
         settings = Settings()
         self.settings = settings
@@ -863,6 +1035,14 @@ class NovaAgent:
             max_seconds=settings.vad_max_seconds,
         )
         self.processor = processor
+        # Voice gate: which voice may wake us (core/voice_gate.py). The default
+        # instance is open unless a voiceprint exists; tests inject their own.
+        self.voice_gate = voice_gate or VoiceGate(settings)
+        # Rolling ~1.5s window of mic frames — enough voice to compare a
+        # speaker when the audio model (not a transcript) fires the wake.
+        self._recent_audio: deque = deque(
+            maxlen=max(1, int(1.5 * settings.sample_rate / settings.sample_block))
+        )
         self.capabilities = capabilities or build_registry(settings)
         self.monitor = monitor or RuntimeMonitor()
         self.hud = hud or NovaHUD(
@@ -885,6 +1065,11 @@ class NovaAgent:
         # Microphone frames are handed to a worker thread so the PortAudio
         # callback never blocks on Whisper or Kokoro playback.
         self.audio_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        # Barge-in: an adaptive energy gate, fed only while Kokoro plays. It
+        # learns the steady playback bleed from real frames, so a person
+        # talking over the reply is a step change above that floor while the
+        # reply's own echo is not (core/barge.py explains why not the VAD).
+        self.barge_gate = BargeGate(sample_rate=settings.sample_rate)
         # Frames the PortAudio callback dropped because the worker fell behind:
         # a gap in what the VAD assembles shows up as a low count here, printed
         # alongside idle segments when debugging.
@@ -893,6 +1078,9 @@ class NovaAgent:
         # Misses may keep the turn alive only up to command_max_turn past it.
         self._turn_started = 0.0
         self.is_speaking = False
+        # When the last reply stopped (distant past at boot: the reverb-tail
+        # guard must not deafen the mic before anything has ever played).
+        self._speaking_ended_at = float("-inf")
         self._worker: threading.Thread | None = None
         self._stopping = False
 
@@ -911,9 +1099,22 @@ class NovaAgent:
 
         if not self.listening:
             if self.wake_engine.process_chunk(chunk):
+                # Voice gate on the rolling window: the sound model crossed on
+                # *something* — confirm it was the enrolled voice before acting.
+                if self.voice_gate.verify_samples(self._recent_audio_window()) is False:
+                    self.wake_engine.reset()
+                    print(
+                        f"[wake] ignored (voice mismatch {self.voice_gate.last_score:.2f} < "
+                        f"{self.voice_gate.threshold:g}, audio model)"
+                    )
+                    return None
                 self._begin_listening("audio model")
                 return "wake"
             if self._transcript_wake_active():
+                # Idle probes are ambient: cap them here so background chatter
+                # cannot buffer toward vad_max_seconds and cost seconds of STT
+                # (field round 8: an 11.5s transcription from one noise segment).
+                self.vad_reader.max_seconds = self.settings.idle_segment_max
                 segment = self.vad_reader.process_chunk(chunk)
                 if segment is not None:
                     return self._wake_from_transcript(segment)
@@ -941,11 +1142,17 @@ class NovaAgent:
         # immediately re-trigger, and reset the ribbon for the new command.
         self.wake_engine.reset()
         self.vad_reader.reset()
+        # Command captures keep the full segment budget; the shorter idle cap
+        # (idle_segment_max) is re-applied by the idle branch on the next frame.
+        self.vad_reader.max_seconds = self.settings.vad_max_seconds
         self.hud.show_transcript("")
         self.hud.set_state("listening", "Listening")
         # Always say it: without this line a successful wake in normal mode is
         # indistinguishable from a dead loop (the HUD alone is easy to miss).
-        print("Wake detected - listening for your command.")
+        # The source names which detector fired: field round 8 traced false
+        # wakes to the audio model, which this line alone never showed.
+        source = "transcript" if how.startswith("transcript") else how
+        print(f"Wake detected ({source}) - listening for your command.")
         if self.debug:
             print(f"[debug] wake detected ({how})")
 
@@ -1039,6 +1246,19 @@ class NovaAgent:
             Path(segment_path).unlink(missing_ok=True)
             return None
 
+        # Voice gate: text cannot separate a real wake from a Whisper prompt
+        # echo on noise (both read "hey dude") — the speaker can. A mismatch
+        # stays silent: nobody addressed us after all.
+        if self.voice_gate.verify_file(segment_path) is False:
+            print(
+                f"[wake] ignored (voice mismatch {self.voice_gate.last_score:.2f} < "
+                f"{self.voice_gate.threshold:g}): {text!r}"
+            )
+            Path(segment_path).unlink(missing_ok=True)
+            return None
+        score = self.voice_gate.last_score
+        suffix = f" (voice {score:.2f})" if score is not None else ""
+        print(f"[wake] matched: {text!r}{suffix}")
         Path(segment_path).unlink(missing_ok=True)
         self._begin_listening(f"transcript: {text!r}")
         if not remainder:
@@ -1081,7 +1301,7 @@ class NovaAgent:
             else:
                 response = self.handle_command(text=text)
         finally:
-            self.is_speaking = False
+            self._finish_speaking()
             self._discard_pending_audio()
         elapsed = time.perf_counter() - started
         if self.debug:
@@ -1188,7 +1408,7 @@ class NovaAgent:
             try:
                 reply = self.processor.transcribe(result, prompt=COMMAND_PROMPT)
             finally:
-                self.is_speaking = False
+                self._finish_speaking()
                 self._discard_pending_audio()
             if self.debug:
                 print(f"[debug] confirmation reply: {reply!r}")
@@ -1207,6 +1427,63 @@ class NovaAgent:
         except ImportError:  # pragma: no cover - psutil is optional.
             pass
 
+    def _barge_begin(self) -> None:
+        """Playback is opening: forget the past, calibrate on real bleed.
+
+        Frames queued before Kokoro opened his mouth are the tail of the user's
+        command or room noise. Feeding them to the gate would seed its baseline
+        wrong — a silent gap right before we speak makes the first echo syllable
+        look like a shout and trips us instantly. Drop them, reset the gate, and
+        let it learn the echo floor from actual playback.
+        """
+        self.barge_gate.reset()
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _barge_check(self) -> bool:
+        """Feed the frames that arrived during the last chunk; True = stop.
+
+        Runs on the worker thread between ~50ms playback chunks, so while
+        speak() holds the floor this is the only consumer of audio_queue — the
+        echo guard that drops frames elsewhere has nobody to drop them here.
+        Returns whether the user talked over the reply long enough to count.
+        """
+        tripped = False
+        while True:
+            try:
+                frame = self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+            if self.barge_gate.feed(frame):
+                tripped = True
+        if tripped:
+            stop = getattr(self.processor.tts, "stop", None)
+            if stop is not None:
+                stop()
+            print("\n[user] talked over the reply — playback stopped")
+        return tripped
+
+    def _finish_speaking(self) -> None:
+        """Reopen the mic and start the reverb-tail cooldown.
+
+        The echo guard only covers playback itself; the room keeps ringing for
+        a few hundred ms after it ends (field round 8: wakes fed by the reverb
+        of our own "Opening chrome"). Every speaking site ends here, so this is
+        the one place that knows when we actually stopped — ``_on_audio`` then
+        drops the tail before it ever reaches the queue.
+        """
+        self.is_speaking = False
+        self._speaking_ended_at = time.monotonic()
+
+    def _recent_audio_window(self) -> np.ndarray:
+        """The last ~1.5s of mic audio — enough voice to compare a speaker."""
+        if not self._recent_audio:
+            return np.empty(0, dtype=np.float32)
+        return np.concatenate(self._recent_audio)
+
     def _on_audio(self, indata, _frames, _time, _status) -> None:
         """PortAudio callback: queue the chunk and return immediately.
 
@@ -1218,7 +1495,15 @@ class NovaAgent:
         the speech, so segments the VAD holds until finalization would be
         written from later (silent) audio. Copy before queueing.
         """
+        # Tail guard: for wake_cooldown seconds after we stop talking the room
+        # is still ringing with us — drop frames at the source so neither the
+        # wake model nor the VAD ever sees our own reverb.
+        if time.monotonic() - self._speaking_ended_at < self.settings.wake_cooldown:
+            return
         chunk = np.array(indata[:, 0], dtype=np.float32)
+        # Rolling window for the voice gate (audio-model path): an append of a
+        # reference — zero copy, nothing here may block.
+        self._recent_audio.append(chunk)
         try:
             self.audio_queue.put_nowait(chunk)
         except queue.Full:
@@ -1251,8 +1536,46 @@ class NovaAgent:
             dropped += 1
         return dropped
 
+    def _fire_due_reminders(self) -> None:
+        """Speak every reminder whose time has come.
+
+        Runs on the worker thread *between* command turns — the same thread
+        that speaks commands — so ``is_speaking`` is never toggled from two
+        places and a reminder can never overlap a command. Going through
+        ``tts.speak`` means the barge gate applies too: you can talk over a
+        reminder and cut it off like any other reply. A reminder is marked
+        fired *before* speaking so a synthesis failure can never make it loop.
+        """
+        if self.context is None or self.processor is None:
+            return
+        if self.is_speaking:  # belt-and-suspenders: never talk over ourselves
+            return
+        due = self.context.due_reminders(int(time.time()))
+        if not due:
+            return
+        for reminder_id, what in due:
+            self.context.mark_reminder_fired(reminder_id)
+            message = f"Reminder: {what}"
+            self.is_speaking = True
+            self.hud.set_state("speaking", "Reminder")
+            try:
+                self._discard_pending_audio()
+                print(message)
+                self.processor.tts.speak(speakable(message))
+            finally:
+                self._finish_speaking()
+                self._discard_pending_audio()
+                self.hud.set_state("listening", "Listening")
+
     def _consume_loop(self) -> None:
+        next_reminder_check = 0.0
         while not self._stopping:
+            if time.monotonic() >= next_reminder_check:
+                next_reminder_check = time.monotonic() + 1.0
+                try:
+                    self._fire_due_reminders()
+                except Exception as exc:  # noqa: BLE001 - a dead reminder must not kill the loop
+                    print(f"Reminder check failed ({type(exc).__name__}): {exc}")
             try:
                 chunk = self.audio_queue.get(timeout=0.2)
             except queue.Empty:
@@ -1341,6 +1664,14 @@ class NovaAgent:
                     target=_warm_models, name="model-warm", daemon=True
                 ).start()
 
+        # Barge-in: while Kokoro speaks, the worker thread blocked in playback
+        # is the only reader of audio_queue — so speak() calls these back
+        # between ~50ms chunks. begin() flushes the pre-playback backlog and
+        # resets the gate; check() feeds the frames that arrived during the
+        # last chunk and reports whether the user talked over the reply.
+        self.processor.tts.barge_begin = self._barge_begin
+        self.processor.tts.barge_check = self._barge_check
+
         mode = "dry-run" if dry_run else "live"
         detector = getattr(self.wake_engine, "backend", "custom")
         print(
@@ -1352,6 +1683,7 @@ class NovaAgent:
             f"Transcript wake: {transcript_mode} "
             f"(idle speech is matched for {self.wake_word!r})"
         )
+        print(f"Voice gate: {self.voice_gate.status()}")
         load_error = getattr(self.wake_engine, "load_error", None)
         if detector != "openwakeword" and load_error:
             print(f"Wake word note: {load_error}")
@@ -1448,7 +1780,11 @@ def check_environment() -> int:
     print(f"Sample rate: {settings.sample_rate} Hz")
     print(f"STT: {settings.stt_model} on {settings.stt_device} ({settings.stt_compute_type})")
     print(f"Execution mode: {'dry-run' if settings.dry_run else 'live'}")
-    print(f"Tier 2 fallback: {'on' if settings.llm_fallback else 'off'}")
+    print(
+        "Tier 2 fallback: "
+        f"{'on' if settings.llm_fallback and not settings.llm_brain else 'off'}"
+    )
+    print(f"LLM brain: {'on' if settings.llm_brain else 'off'}")
     tesseract = settings.tesseract_path or "default (PATH)"
     print(f"Tesseract: {tesseract}")
 
@@ -1464,6 +1800,7 @@ def check_environment() -> int:
         f"Wake phrase: {settings.wake_word!r} "
         f"(transcript wake: {'on' if settings.transcript_wake else 'off'})"
     )
+    print(f"Voice gate: {VoiceGate(settings).status()}")
 
     recorder = VADRecorder(
         max_silence=settings.vad_silence_frames,
@@ -1499,6 +1836,7 @@ def check_environment() -> int:
         "openwakeword",
         "onnxruntime",
         "psutil",
+        "speechbrain",  # voice gate (missing = --enroll-voice refuses politely)
     ):
         status = "installed" if importlib.util.find_spec(package) else "missing"
         print(f"{package}: {status}")
@@ -1802,6 +2140,11 @@ def main() -> None:
     parser.add_argument(
         "--check", action="store_true", help="report the environment, detectors, and capabilities"
     )
+    parser.add_argument(
+        "--enroll-voice",
+        action="store_true",
+        help="record a short session and store the voiceprint for the wake voice gate",
+    )
     parser.add_argument("--once", action="store_true", help="record and process one command")
     parser.add_argument("--listen", action="store_true", help="start the hands-free wake-word loop")
     parser.add_argument(
@@ -1859,12 +2202,14 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "override the wake trigger score (default: 0.5 with the openWakeWord "
+            "override the wake trigger score (default: 0.65 with the openWakeWord "
             "model, 0.13 with the energy fallback)"
         ),
     )
     args = parser.parse_args()
     dry_run = False if args.live else Settings().dry_run
+    if args.enroll_voice:
+        raise SystemExit(0 if enroll_voice() else 1)
     if args.check:
         raise SystemExit(check_environment())
     if args.once:
